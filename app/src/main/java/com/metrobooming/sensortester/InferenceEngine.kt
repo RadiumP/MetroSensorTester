@@ -1,32 +1,41 @@
 package com.metrobooming.sensortester
 
-import kotlin.math.max
-
 data class InferenceResult(
     val state: String,
     val rawState: String,
-    val intensity: Double,
-    val movingGuard: Boolean,
-    val stopSignalsLow: Boolean,
-    val phoneMotionRejected: Boolean,
+    val trainState: String,
+    val rawTrainState: String,
+    val playerActive: Boolean,
+    val micLevelRatio: Double,
+    val micAboveMovingThreshold: Boolean,
+    val micBelowStopThreshold: Boolean,
+    val stopCandidateElapsedMs: Long,
     val reason: String,
 )
 
 class InferenceEngine {
-    private val micHistory = ArrayDeque<Double>()
-    private val accelHistory = ArrayDeque<Double>()
-    private var smoothed: Double? = null
-    private var stableState = "校准中"
-    private var candidateState = ""
-    private var candidateSince = 0L
+    companion object {
+        // Thresholds are normalized PCM16 RMS values produced directly by AudioRecord.
+        // They were selected from the manually labelled Android recordings in this project.
+        const val MIC_STOP_RMS_THRESHOLD = 0.0014
+        const val MIC_MOVING_RMS_THRESHOLD = 0.0030
+        const val STOP_CONFIRMATION_MS = 3_000L
+
+        const val PLAYER_ACCEL_RMS_THRESHOLD = 0.40
+        const val PLAYER_GYRO_RMS_THRESHOLD_DEG_S = 15.0
+
+        private const val STATE_CALIBRATING = "校准中"
+        private const val STATE_MOVING = "运行"
+        private const val STATE_STOPPED = "停站"
+        private const val STATE_STOPPED_PLAYER_ACTIVE = "停站但玩家活动"
+    }
+
+    private var stableTrainState = STATE_CALIBRATING
+    private var stopCandidateSince: Long? = null
 
     fun reset() {
-        micHistory.clear()
-        accelHistory.clear()
-        smoothed = null
-        stableState = "校准中"
-        candidateState = ""
-        candidateSince = 0L
+        stableTrainState = STATE_CALIBRATING
+        stopCandidateSince = null
     }
 
     fun update(
@@ -35,79 +44,97 @@ class InferenceEngine {
         accelRms: Double,
         gyroDegreesRms: Double,
         now: Long,
-        startedAt: Long,
     ): InferenceResult {
-        val phoneMotionRejected = gyroDegreesRms > 45.0
-        if (micValid) push(micHistory, micRms)
-        if (!phoneMotionRejected) push(accelHistory, accelRms)
+        val playerActive = accelRms >= PLAYER_ACCEL_RMS_THRESHOLD ||
+            gyroDegreesRms >= PLAYER_GYRO_RMS_THRESHOLD_DEG_S
+        val micAboveMovingThreshold = micValid && micRms >= MIC_MOVING_RMS_THRESHOLD
+        val micBelowStopThreshold = micValid && micRms <= MIC_STOP_RMS_THRESHOLD
+        val micLevelRatio = if (micValid) {
+            micRms / ((MIC_STOP_RMS_THRESHOLD + MIC_MOVING_RMS_THRESHOLD) / 2.0)
+        } else {
+            0.0
+        }
 
-        if (now - startedAt < 10_000L || micHistory.size < 40 || accelHistory.size < 40) {
+        if (!micValid) {
+            stopCandidateSince = null
+            val heldState = combinedState(stableTrainState, playerActive)
             return InferenceResult(
-                "校准中", "校准中", 0.0, false, false,
-                phoneMotionRejected, "calibrating"
+                state = heldState,
+                rawState = heldState,
+                trainState = stableTrainState,
+                rawTrainState = stableTrainState,
+                playerActive = playerActive,
+                micLevelRatio = micLevelRatio,
+                micAboveMovingThreshold = false,
+                micBelowStopThreshold = false,
+                stopCandidateElapsedMs = 0L,
+                reason = "mic-unavailable-hold-state",
             )
         }
 
-        val accelForInference = if (phoneMotionRejected) percentile(accelHistory, 0.5) else accelRms
-        val sound = normalize(micRms, percentile(micHistory, 0.2), percentile(micHistory, 0.8))
-        val vibration = normalize(
-            accelForInference,
-            percentile(accelHistory, 0.2),
-            percentile(accelHistory, 0.8),
-        )
-        val rawIntensity = 0.72 * sound + 0.28 * vibration
-        smoothed = smoothed?.let { 0.4 * rawIntensity + 0.6 * it } ?: rawIntensity
-        val intensity = smoothed ?: rawIntensity
+        val rawTrainState = when {
+            micAboveMovingThreshold -> STATE_MOVING
+            micBelowStopThreshold -> STATE_STOPPED
+            stopCandidateSince != null -> STATE_STOPPED
+            stableTrainState == STATE_MOVING -> STATE_MOVING
+            stableTrainState == STATE_STOPPED -> STATE_STOPPED
+            micRms >= (MIC_STOP_RMS_THRESHOLD + MIC_MOVING_RMS_THRESHOLD) / 2.0 -> STATE_MOVING
+            else -> STATE_STOPPED
+        }
 
-        val movingGuard = micRms > 0.060 || accelForInference > 0.40
-        val stopSignalsLow = micRms < 0.055 && accelForInference < 0.35
-        val stopCandidate = !movingGuard && stopSignalsLow && intensity < 0.30
-        val movingCandidate = movingGuard || intensity >= 0.43
-
-        val raw: String
-        val reason: String
-        if (stableState == "停站") {
-            raw = if (movingCandidate) "运行" else "停站"
-            reason = when {
-                movingGuard -> "absolute-moving-guard"
-                movingCandidate -> "exit-stop-intensity"
-                else -> "hold-stop"
+        var reason: String
+        var stopCandidateElapsedMs = 0L
+        if (rawTrainState == STATE_MOVING) {
+            stableTrainState = STATE_MOVING
+            stopCandidateSince = null
+            reason = if (micAboveMovingThreshold) {
+                "mic-above-moving-threshold"
+            } else {
+                "mic-hysteresis-hold-moving"
             }
         } else {
-            raw = if (stopCandidate) "停站" else "运行"
-            reason = when {
-                movingGuard -> "absolute-moving-guard"
-                stopCandidate -> "enter-stop-confirmed"
-                else -> "hold-moving"
+            if (stableTrainState == STATE_STOPPED) {
+                stopCandidateSince = null
+                reason = if (micBelowStopThreshold) {
+                    "mic-below-stop-threshold"
+                } else {
+                    "mic-hysteresis-hold-stopped"
+                }
+            } else {
+                val candidateSince = stopCandidateSince ?: now.also { stopCandidateSince = it }
+                stopCandidateElapsedMs = (now - candidateSince).coerceAtLeast(0L)
+                if (stopCandidateElapsedMs >= STOP_CONFIRMATION_MS) {
+                    stableTrainState = STATE_STOPPED
+                    stopCandidateSince = null
+                    reason = "mic-stop-confirmed"
+                } else {
+                    reason = "mic-stop-confirming"
+                }
             }
         }
 
-        if (raw != candidateState) {
-            candidateState = raw
-            candidateSince = now
-        }
-        val holdMs = if (raw == "停站") 8_000L else 2_500L
-        if (now - candidateSince >= holdMs) stableState = raw
+        val rawState = combinedState(rawTrainState, playerActive)
+        val state = combinedState(stableTrainState, playerActive)
+        if (state == STATE_STOPPED_PLAYER_ACTIVE) reason = "stopped-player-active"
 
         return InferenceResult(
-            stableState, raw, intensity, movingGuard, stopSignalsLow,
-            phoneMotionRejected, reason
+            state = state,
+            rawState = rawState,
+            trainState = stableTrainState,
+            rawTrainState = rawTrainState,
+            playerActive = playerActive,
+            micLevelRatio = micLevelRatio,
+            micAboveMovingThreshold = micAboveMovingThreshold,
+            micBelowStopThreshold = micBelowStopThreshold,
+            stopCandidateElapsedMs = stopCandidateElapsedMs,
+            reason = reason,
         )
     }
 
-    private fun push(queue: ArrayDeque<Double>, value: Double) {
-        queue.addLast(value)
-        if (queue.size > 480) queue.removeFirst()
-    }
-
-    private fun percentile(queue: ArrayDeque<Double>, p: Double): Double {
-        if (queue.isEmpty()) return 0.0
-        val sorted = queue.sorted()
-        val index = ((sorted.size - 1) * p).toInt().coerceIn(sorted.indices)
-        return sorted[index]
-    }
-
-    private fun normalize(value: Double, low: Double, high: Double): Double {
-        return ((value - low) / max(high - low, 0.0001)).coerceIn(0.0, 1.0)
-    }
+    private fun combinedState(trainState: String, playerActive: Boolean): String =
+        if (trainState == STATE_STOPPED && playerActive) {
+            STATE_STOPPED_PLAYER_ACTIVE
+        } else {
+            trainState
+        }
 }

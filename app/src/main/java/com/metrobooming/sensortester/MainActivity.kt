@@ -9,7 +9,6 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -57,8 +56,11 @@ class MainActivity : Activity() {
         "magnet_active", "magnet_x_ut", "magnet_y_ut", "magnet_z_ut", "magnet_magnitude_ut",
         "pressure_active", "pressure_hpa",
         "mic_active", "mic_valid", "mic_rms", "mic_peak", "mic_input_device",
-        "raw_state", "train_state", "is_moving", "train_intensity",
-        "moving_guard", "stop_signals_low", "phone_motion_rejected", "decision_reason",
+        "state_schema_version", "raw_state", "state", "raw_train_state", "train_state",
+        "player_state", "is_train_moving", "is_player_active",
+        "mic_level_ratio", "mic_stop_rms_threshold", "mic_moving_rms_threshold",
+        "mic_above_moving_threshold", "mic_below_stop_threshold",
+        "stop_confirmation_ms", "stop_candidate_elapsed_ms", "decision_reason",
         "mark", "segment_id", "device_model", "android_version"
     )
 
@@ -83,6 +85,7 @@ class MainActivity : Activity() {
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
         root.addView(text("原生 Android 传感器采集器 · 250 ms/条", 14f, Color.LTGRAY))
+        root.addView(text(versionLabel(), 13f, Color.GRAY))
 
         statusText = text("尚未开始", 22f, Color.rgb(91, 201, 232)).also { root.addView(it) }
         markText = text("人工标记：未标记", 16f, Color.WHITE).also { root.addView(it) }
@@ -115,6 +118,17 @@ class MainActivity : Activity() {
             Color.GRAY,
         ))
         return scroll
+    }
+
+    @Suppress("DEPRECATION")
+    private fun versionLabel(): String {
+        val packageInfo = packageManager.getPackageInfo(packageName, 0)
+        val versionCode = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+            packageInfo.longVersionCode
+        } else {
+            packageInfo.versionCode.toLong()
+        }
+        return "版本 ${packageInfo.versionName.orEmpty()} ($versionCode)"
     }
 
     private fun text(value: String, size: Float, color: Int) = TextView(this).apply {
@@ -197,7 +211,7 @@ class MainActivity : Activity() {
             val gyroRmsDeg = sensor.gyroRms * 180.0 / PI
             val gyroPeakDeg = sensor.gyroPeak * 180.0 / PI
             val inferred = inference.update(
-                mic.rms, mic.valid, sensor.accelRms, gyroRmsDeg, now, startedAt
+                mic.rms, mic.valid, sensor.accelRms, gyroRmsDeg, now
             )
 
             statusText.text = "${inferred.state} · ${formatElapsed(now - startedAt)} · ${rows.size + 1} 条"
@@ -205,17 +219,19 @@ class MainActivity : Activity() {
                 when (inferred.state) {
                     "运行" -> Color.rgb(255, 159, 69)
                     "停站" -> Color.rgb(168, 214, 108)
+                    "停站但玩家活动" -> Color.rgb(255, 214, 102)
                     else -> Color.rgb(91, 201, 232)
                 }
             )
             valuesText.text = buildString {
                 appendLine("麦克风 RMS : %.5f".format(Locale.US, mic.rms))
+                appendLine("麦克风比值  : %.2f ×".format(Locale.US, inferred.micLevelRatio))
                 appendLine("输入设备    : ${mic.inputDevice}")
                 appendLine("加速度 RMS : %.4f m/s²".format(Locale.US, sensor.accelRms))
                 appendLine("陀螺仪 RMS : %.2f °/s".format(Locale.US, gyroRmsDeg))
+                appendLine("玩家活动    : ${if (inferred.playerActive) "是" else "否"}")
                 appendLine("磁场强度    : ${format(sensor.magnetMagnitude, 2)} μT")
                 appendLine("气压        : ${format(sensor.pressureHpa?.toDouble(), 2)} hPa")
-                appendLine("综合强度    : %.3f".format(Locale.US, inferred.intensity))
                 append("判定依据    : ${inferred.reason}")
             }
 
@@ -227,10 +243,18 @@ class MainActivity : Activity() {
                 sensor.magnetX, sensor.magnetY, sensor.magnetZ, sensor.magnetMagnitude,
                 if (sensor.pressureHpa != null) 1 else 0, sensor.pressureHpa,
                 if (mic.active) 1 else 0, if (mic.valid) 1 else 0, mic.rms, mic.peak, mic.inputDevice,
-                inferred.rawState, inferred.state, if (inferred.rawState == "运行") 1 else 0,
-                inferred.intensity, if (inferred.movingGuard) 1 else 0,
-                if (inferred.stopSignalsLow) 1 else 0,
-                if (inferred.phoneMotionRejected) 1 else 0, inferred.reason,
+                2, inferred.rawState, inferred.state,
+                inferred.rawTrainState, inferred.trainState,
+                if (inferred.playerActive) "活动" else "静止",
+                if (inferred.trainState == "运行") 1 else 0,
+                if (inferred.playerActive) 1 else 0,
+                inferred.micLevelRatio,
+                InferenceEngine.MIC_STOP_RMS_THRESHOLD,
+                InferenceEngine.MIC_MOVING_RMS_THRESHOLD,
+                if (inferred.micAboveMovingThreshold) 1 else 0,
+                if (inferred.micBelowStopThreshold) 1 else 0,
+                InferenceEngine.STOP_CONFIRMATION_MS,
+                inferred.stopCandidateElapsedMs, inferred.reason,
                 currentMark, segmentId, android.os.Build.MODEL, android.os.Build.VERSION.RELEASE,
             )
             handler.postDelayed(this, TICK_MS)
