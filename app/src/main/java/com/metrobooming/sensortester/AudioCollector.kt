@@ -1,14 +1,16 @@
 package com.metrobooming.sensortester
 
 import android.annotation.SuppressLint
+import android.content.Context
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
+import android.util.Log
 import kotlin.concurrent.thread
-import kotlin.math.abs
-import kotlin.math.sqrt
 
 data class AudioSnapshot(
     val active: Boolean,
@@ -18,22 +20,24 @@ data class AudioSnapshot(
     val inputDevice: String,
     val zeroDurationMs: Long,
     val restartCount: Int,
-    val quality: String,
+    val quality: MicQuality,
     val audioRecordState: String,
 )
 
-class AudioCollector {
+class AudioCollector(context: Context) {
     companion object {
-        const val QUALITY_NORMAL = MicQualityMonitor.QUALITY_NORMAL
-        const val QUALITY_ZERO_ABNORMAL = MicQualityMonitor.QUALITY_ZERO_ABNORMAL
-        const val QUALITY_RECOVERING = MicQualityMonitor.QUALITY_RECOVERING
-
+        private const val TAG = "AudioCollector"
         private const val SAMPLE_RATE = 16_000
         private const val RESTART_AFTER_ZERO_MS = 5_000L
         private const val MIN_RESTART_INTERVAL_MS = 15_000L
     }
 
-    private val lock = Any()
+    private val audioManager =
+        context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    private val metrics = AudioMetrics()
+    private val qualityMonitor = MicQualityMonitor()
+
     private val lifecycleLock = Any()
 
     @Volatile
@@ -42,84 +46,62 @@ class AudioCollector {
     @Volatile
     private var recorder: AudioRecord? = null
 
-    private var squareSum = 0.0
-    private var sampleCount = 0L
-    private var peak = 0.0
-    private var deviceName = "未启动"
-    private val qualityMonitor = MicQualityMonitor()
-    private var latestQuality = MicQualityResult(false, QUALITY_RECOVERING, 0L)
+    @Volatile
+    private var routeName = "未启动"
+
+    @Volatile
+    private var latestQuality = MicQualityResult(false, MicQuality.RECOVERING, 0L)
+
     private var restartCount = 0
     private var lastRestartAt = 0L
+    private var audioDeviceCallback: AudioDeviceCallback? = null
 
     @SuppressLint("MissingPermission")
     fun start(): Boolean = synchronized(lifecycleLock) {
         if (collecting && recorder != null) return true
         collecting = true
-        synchronized(lock) {
-            squareSum = 0.0
-            sampleCount = 0L
-            peak = 0.0
-            latestQuality = qualityMonitor.reset()
-            restartCount = 0
-            lastRestartAt = System.currentTimeMillis()
-            deviceName = "正在启动"
-        }
+        metrics.clear()
+        latestQuality = qualityMonitor.reset()
+        restartCount = 0
+        lastRestartAt = System.currentTimeMillis()
+        routeName = "正在启动"
+        registerRouteListener()
         createAndStartRecorder()
     }
 
-    fun takeSnapshot(now: Long): AudioSnapshot = synchronized(lock) {
-        val rms = if (sampleCount > 0) sqrt(squareSum / sampleCount) else 0.0
-        latestQuality = qualityMonitor.update(rms, sampleCount > 0, now)
+    fun takeSnapshot(now: Long): AudioSnapshot {
+        val window = metrics.take()
+        latestQuality = qualityMonitor.update(window.rms, window.hasSamples, now)
         val state = audioRecordState()
-        val result = AudioSnapshot(
+        return AudioSnapshot(
             active = state == "RECORDING",
             valid = latestQuality.valid,
-            rms = rms,
-            peak = peak,
-            inputDevice = deviceName,
+            rms = window.rms,
+            peak = window.peak,
+            inputDevice = routeName,
             zeroDurationMs = latestQuality.zeroDurationMs,
             restartCount = restartCount,
             quality = latestQuality.quality,
             audioRecordState = state,
         )
-        squareSum = 0.0
-        sampleCount = 0L
-        peak = 0.0
-        result
     }
 
     @SuppressLint("MissingPermission")
     fun restartIfNeeded(now: Long): Boolean {
-        val shouldRestart = synchronized(lock) {
-            collecting &&
-                (
-                    recorder == null ||
-                        (
-                            latestQuality.quality == QUALITY_ZERO_ABNORMAL &&
-                                latestQuality.zeroDurationMs >= RESTART_AFTER_ZERO_MS
-                            )
-                    ) &&
-                now - lastRestartAt >= MIN_RESTART_INTERVAL_MS
-        }
-        if (!shouldRestart) return false
+        if (!restartDue(now)) return false
 
         return synchronized(lifecycleLock) {
             if (!collecting) return@synchronized false
-            synchronized(lock) {
-                restartCount++
-                lastRestartAt = now
-                squareSum = 0.0
-                sampleCount = 0L
-                peak = 0.0
-            }
+            restartCount++
+            lastRestartAt = now
+            metrics.clear()
             val old = recorder
             recorder = null
             stopAndRelease(old)
             val restarted = createAndStartRecorder()
             if (!restarted) {
-                synchronized(lock) {
-                    deviceName = "AudioRecord 重启失败"
-                }
+                routeName = "AudioRecord 重启失败"
+                Log.w(TAG, "AudioRecord restart failed")
             }
             restarted
         }
@@ -127,16 +109,24 @@ class AudioCollector {
 
     fun stop() = synchronized(lifecycleLock) {
         collecting = false
+        unregisterRouteListener()
         val current = recorder
         recorder = null
         stopAndRelease(current)
-        synchronized(lock) {
-            squareSum = 0.0
-            sampleCount = 0L
-            peak = 0.0
-            deviceName = "已停止"
-        }
+        metrics.clear()
+        routeName = "已停止"
     }
+
+    private fun restartDue(now: Long): Boolean =
+        collecting &&
+            (
+                recorder == null ||
+                    (
+                        latestQuality.quality == MicQuality.ZERO_ABNORMAL &&
+                            latestQuality.zeroDurationMs >= RESTART_AFTER_ZERO_MS
+                        )
+                ) &&
+            now - lastRestartAt >= MIN_RESTART_INTERVAL_MS
 
     @SuppressLint("MissingPermission")
     private fun createAndStartRecorder(): Boolean {
@@ -145,28 +135,35 @@ class AudioCollector {
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
         )
-        if (minimum <= 0) return false
+        if (minimum <= 0) {
+            Log.w(TAG, "AudioRecord min buffer size invalid: $minimum")
+            return false
+        }
 
         val audioRecord = createRecorder(MediaRecorder.AudioSource.UNPROCESSED, minimum)
             ?: createRecorder(MediaRecorder.AudioSource.MIC, minimum)
-            ?: return false
+            ?: run {
+                Log.w(TAG, "AudioRecord creation failed for UNPROCESSED and MIC sources")
+                return false
+            }
         return try {
             audioRecord.startRecording()
             if (audioRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
                 audioRecord.release()
+                Log.w(TAG, "AudioRecord did not enter recording state")
                 false
             } else {
                 recorder = audioRecord
-                synchronized(lock) {
-                    deviceName = routedDeviceName(audioRecord)
-                }
+                refreshRouteName(audioRecord)
                 thread(name = "metro-audio", isDaemon = true) { readLoop(audioRecord) }
                 true
             }
-        } catch (_: IllegalStateException) {
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "AudioRecord startRecording failed", e)
             audioRecord.release()
             false
-        } catch (_: SecurityException) {
+        } catch (e: SecurityException) {
+            Log.w(TAG, "AudioRecord startRecording denied", e)
             audioRecord.release()
             false
         }
@@ -198,7 +195,8 @@ class AudioCollector {
         while (collecting && recorder === audioRecord) {
             val count = try {
                 audioRecord.read(buffer, 0, buffer.size)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                Log.w(TAG, "AudioRecord read threw", e)
                 break
             }
             if (count <= 0) {
@@ -207,6 +205,7 @@ class AudioCollector {
                     count == AudioRecord.ERROR_INVALID_OPERATION ||
                     count == AudioRecord.ERROR_BAD_VALUE
                 ) {
+                    Log.w(TAG, "AudioRecord read failed with code $count")
                     if (recorder === audioRecord) {
                         recorder = null
                         stopAndRelease(audioRecord)
@@ -215,16 +214,33 @@ class AudioCollector {
                 }
                 continue
             }
-            synchronized(lock) {
-                for (i in 0 until count) {
-                    val normalized = buffer[i] / 32768.0
-                    squareSum += normalized * normalized
-                    sampleCount++
-                    peak = maxOf(peak, abs(normalized))
-                }
-                deviceName = routedDeviceName(audioRecord)
+            metrics.add(buffer, count)
+        }
+    }
+
+    private fun registerRouteListener() {
+        unregisterRouteListener()
+        val callback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                recorder?.let(::refreshRouteName)
+            }
+
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                recorder?.let(::refreshRouteName)
             }
         }
+        audioManager.registerAudioDeviceCallback(callback, null)
+        audioDeviceCallback = callback
+    }
+
+    private fun unregisterRouteListener() {
+        val callback = audioDeviceCallback ?: return
+        audioManager.unregisterAudioDeviceCallback(callback)
+        audioDeviceCallback = null
+    }
+
+    private fun refreshRouteName(audioRecord: AudioRecord) {
+        routeName = routedDeviceName(audioRecord)
     }
 
     private fun routedDeviceName(audioRecord: AudioRecord): String {

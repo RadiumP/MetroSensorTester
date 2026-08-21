@@ -76,6 +76,7 @@ class SensorCollector(context: Context) : SensorEventListener {
     }
 
     fun start() {
+        gravity.fill(0f)
         val rate = SensorManager.SENSOR_DELAY_GAME
         manager.registerListener(this, linearAcceleration ?: accelerometer, rate)
         manager.registerListener(this, gyroscope, rate)

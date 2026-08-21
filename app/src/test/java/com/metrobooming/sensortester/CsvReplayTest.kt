@@ -7,6 +7,8 @@ import org.junit.Assume.assumeTrue
 import org.junit.Test
 
 class CsvReplayTest {
+    private val config = TuningConfig()
+
     @Test
     fun replayConfiguredCsvFiles() {
         val configured = System.getenv("METRO_REPLAY_CSV_PATHS").orEmpty()
@@ -68,11 +70,11 @@ class CsvReplayTest {
         var maxZeroDurationMs = 0L
         var abnormalStateChanges = 0
         var zeroStateChanges = 0
-        var heldZeroTrainState: String? = null
+        var heldZeroTrainState: TrainState? = null
         var heldZeroHistorySize: Int? = null
         var heldZeroDynamicStop: Double? = null
         var heldZeroDynamicMoving: Double? = null
-        var heldTrainState: String? = null
+        var heldTrainState: TrainState? = null
         var heldHistorySize: Int? = null
         var heldDynamicStop: Double? = null
         var heldDynamicMoving: Double? = null
@@ -95,7 +97,7 @@ class CsvReplayTest {
                 now = now,
             )
 
-            if (rms < InferenceEngine.MIC_NONZERO_FLOOR) {
+            if (rms < config.micNonZeroFloor) {
                 if (heldZeroTrainState == null) {
                     heldZeroTrainState = result.trainState
                     heldZeroHistorySize = result.validMicSampleCount
@@ -114,7 +116,7 @@ class CsvReplayTest {
                 heldZeroDynamicMoving = null
             }
 
-            if (quality.quality == MicQualityMonitor.QUALITY_ZERO_ABNORMAL) {
+            if (quality.quality == MicQuality.ZERO_ABNORMAL) {
                 zeroAbnormalRows++
                 maxZeroDurationMs = maxOf(maxZeroDurationMs, quality.zeroDurationMs)
                 if (heldTrainState == null) {
@@ -135,19 +137,25 @@ class CsvReplayTest {
                 heldDynamicMoving = null
             }
 
-            val mark = row[markIndex]
+            val markState = TrainState.fromLabel(row[markIndex])
             if (
-                mark in setOf("运行", "停站") &&
-                result.trainState in setOf("运行", "停站")
+                markState != null && markState != TrainState.CALIBRATING &&
+                result.trainState != TrainState.CALIBRATING
             ) {
                 evaluated++
-                if (result.trainState == mark) correct++
-                if (mark == "运行") {
-                    runningTotal++
-                    if (result.trainState == "运行") runningCorrect++
-                } else {
-                    stoppedTotal++
-                    if (result.trainState == "停站") stoppedCorrect++
+                if (result.trainState == markState) correct++
+                when (markState) {
+                    TrainState.MOVING -> {
+                        runningTotal++
+                        if (result.trainState == TrainState.MOVING) runningCorrect++
+                    }
+
+                    TrainState.STOPPED -> {
+                        stoppedTotal++
+                        if (result.trainState == TrainState.STOPPED) stoppedCorrect++
+                    }
+
+                    else -> {}
                 }
             }
         }

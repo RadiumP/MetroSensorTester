@@ -1,7 +1,6 @@
 package com.metrobooming.sensortester
 
 import android.Manifest
-import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -21,15 +20,15 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-class MainActivity : Activity() {
+class MainActivity : ComponentActivity() {
     companion object {
-        private const val START_PERMISSION_REQUEST = 100
-        private const val EXPORT_REQUEST = 101
         private const val UI_TICK_MS = 250L
     }
 
@@ -37,6 +36,14 @@ class MainActivity : Activity() {
     private var recordingService: RecordingService? = null
     private var serviceBound = false
     private var pendingCsv: String? = null
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grants -> onPermissionsResult(grants) }
+
+    private val exportLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv"),
+    ) { uri -> uri?.let(::writeCsvTo) }
 
     private lateinit var statusText: TextView
     private lateinit var valuesText: TextView
@@ -117,8 +124,8 @@ class MainActivity : Activity() {
         root.addView(controls)
 
         val labels = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        labels.addView(button("停站") { setMark("停站") }, weighted())
-        labels.addView(button("运行") { setMark("运行") }, weighted())
+        labels.addView(button("停站") { setMark(TrainState.STOPPED.label) }, weighted())
+        labels.addView(button("运行") { setMark(TrainState.MOVING.label) }, weighted())
         labels.addView(button("清除标记") { setMark("") }, weighted())
         root.addView(labels)
 
@@ -175,25 +182,27 @@ class MainActivity : Activity() {
             "尚未开始"
         }
         statusText.setTextColor(
-            when (inferred?.state) {
-                "运行" -> Color.rgb(255, 159, 69)
-                "停站" -> Color.rgb(168, 214, 108)
-                "停站但玩家活动" -> Color.rgb(255, 214, 102)
+            when {
+                inferred == null -> Color.rgb(91, 201, 232)
+                inferred.trainState == TrainState.MOVING -> Color.rgb(255, 159, 69)
+                inferred.trainState == TrainState.STOPPED && inferred.playerActive ->
+                    Color.rgb(255, 214, 102)
+                inferred.trainState == TrainState.STOPPED -> Color.rgb(168, 214, 108)
                 else -> Color.rgb(91, 201, 232)
             }
         )
 
         valuesText.text = buildString {
-            appendLine("列车状态    : ${inferred?.trainState ?: "等待"}")
-            appendLine("玩家状态    : ${inferred?.playerState ?: "等待"}")
-            appendLine("麦克风状态  : ${mic?.quality ?: "未启动"}")
+            appendLine("列车状态    : ${inferred?.trainState?.label ?: "等待"}")
+            appendLine("玩家状态    : ${inferred?.playerState?.label ?: "等待"}")
+            appendLine("麦克风状态  : ${mic?.quality?.label ?: "未启动"}")
             appendLine("麦克风 RMS : ${format(mic?.rms, 6)}")
             appendLine("输入设备    : ${mic?.inputDevice ?: "未启动"}")
             appendLine(
                 "采用阈值    : 停 ${format(inferred?.effectiveStopThreshold, 6)} / " +
                     "行 ${format(inferred?.effectiveMovingThreshold, 6)}"
             )
-            appendLine("阈值模式    : ${inferred?.thresholdMode ?: "固定"}")
+            appendLine("阈值模式    : ${inferred?.thresholdMode?.label ?: "固定"}")
             appendLine("Audio重启   : ${mic?.restartCount ?: 0} 次")
             appendLine("Audio状态   : ${mic?.audioRecordState ?: "STOPPED"}")
             appendLine(
@@ -226,26 +235,18 @@ class MainActivity : Activity() {
         if (missing.isEmpty()) {
             startRecording()
         } else {
-            requestPermissions(missing.toTypedArray(), START_PERMISSION_REQUEST)
+            permissionLauncher.launch(missing.toTypedArray())
         }
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray,
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != START_PERMISSION_REQUEST) return
-
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+    private fun onPermissionsResult(grants: Map<String, Boolean>) {
+        if (grants[Manifest.permission.RECORD_AUDIO] != true) {
             Toast.makeText(this, "没有麦克风权限，无法开始采集", Toast.LENGTH_LONG).show()
             return
         }
         if (
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
+            grants[Manifest.permission.POST_NOTIFICATIONS] != true
         ) {
             Toast.makeText(
                 this,
@@ -284,26 +285,16 @@ class MainActivity : Activity() {
         pendingCsv = recordingService?.buildCsv()
         val localTime = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")
             .withZone(ZoneId.systemDefault()).format(Instant.now())
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "text/csv"
-            putExtra(Intent.EXTRA_TITLE, "metro-native-$localTime.csv")
-        }
-        startActivityForResult(intent, EXPORT_REQUEST)
+        exportLauncher.launch("metro-native-$localTime.csv")
     }
 
-    @Deprecated("Uses the platform document picker for broad Android compatibility")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == EXPORT_REQUEST && resultCode == RESULT_OK) {
-            val uri: Uri = data?.data ?: return
-            contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use {
-                it.write("\uFEFF")
-                it.write(pendingCsv.orEmpty())
-            }
-            Toast.makeText(this, "CSV 已保存", Toast.LENGTH_LONG).show()
-            pendingCsv = null
+    private fun writeCsvTo(uri: Uri) {
+        contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use {
+            it.write("\uFEFF")
+            it.write(pendingCsv.orEmpty())
         }
+        Toast.makeText(this, "CSV 已保存", Toast.LENGTH_LONG).show()
+        pendingCsv = null
     }
 
     private fun showCapabilities() {
