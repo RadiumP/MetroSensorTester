@@ -7,6 +7,7 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Build
 import kotlin.concurrent.thread
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 data class AudioSnapshot(
@@ -15,52 +16,174 @@ data class AudioSnapshot(
     val rms: Double,
     val peak: Double,
     val inputDevice: String,
+    val zeroDurationMs: Long,
+    val restartCount: Int,
+    val quality: String,
+    val audioRecordState: String,
 )
 
 class AudioCollector {
-    private val sampleRate = 16_000
+    companion object {
+        const val QUALITY_NORMAL = MicQualityMonitor.QUALITY_NORMAL
+        const val QUALITY_ZERO_ABNORMAL = MicQualityMonitor.QUALITY_ZERO_ABNORMAL
+        const val QUALITY_RECOVERING = MicQualityMonitor.QUALITY_RECOVERING
+
+        private const val SAMPLE_RATE = 16_000
+        private const val RESTART_AFTER_ZERO_MS = 5_000L
+        private const val MIN_RESTART_INTERVAL_MS = 15_000L
+    }
+
     private val lock = Any()
+    private val lifecycleLock = Any()
+
+    @Volatile
+    private var collecting = false
+
+    @Volatile
     private var recorder: AudioRecord? = null
-    @Volatile private var running = false
+
     private var squareSum = 0.0
     private var sampleCount = 0L
     private var peak = 0.0
     private var deviceName = "未启动"
+    private val qualityMonitor = MicQualityMonitor()
+    private var latestQuality = MicQualityResult(false, QUALITY_RECOVERING, 0L)
+    private var restartCount = 0
+    private var lastRestartAt = 0L
 
     @SuppressLint("MissingPermission")
-    fun start(): Boolean {
-        if (running) return true
+    fun start(): Boolean = synchronized(lifecycleLock) {
+        if (collecting && recorder != null) return true
+        collecting = true
+        synchronized(lock) {
+            squareSum = 0.0
+            sampleCount = 0L
+            peak = 0.0
+            latestQuality = qualityMonitor.reset()
+            restartCount = 0
+            lastRestartAt = System.currentTimeMillis()
+            deviceName = "正在启动"
+        }
+        createAndStartRecorder()
+    }
+
+    fun takeSnapshot(now: Long): AudioSnapshot = synchronized(lock) {
+        val rms = if (sampleCount > 0) sqrt(squareSum / sampleCount) else 0.0
+        latestQuality = qualityMonitor.update(rms, sampleCount > 0, now)
+        val state = audioRecordState()
+        val result = AudioSnapshot(
+            active = state == "RECORDING",
+            valid = latestQuality.valid,
+            rms = rms,
+            peak = peak,
+            inputDevice = deviceName,
+            zeroDurationMs = latestQuality.zeroDurationMs,
+            restartCount = restartCount,
+            quality = latestQuality.quality,
+            audioRecordState = state,
+        )
+        squareSum = 0.0
+        sampleCount = 0L
+        peak = 0.0
+        result
+    }
+
+    @SuppressLint("MissingPermission")
+    fun restartIfNeeded(now: Long): Boolean {
+        val shouldRestart = synchronized(lock) {
+            collecting &&
+                (
+                    recorder == null ||
+                        (
+                            latestQuality.quality == QUALITY_ZERO_ABNORMAL &&
+                                latestQuality.zeroDurationMs >= RESTART_AFTER_ZERO_MS
+                            )
+                    ) &&
+                now - lastRestartAt >= MIN_RESTART_INTERVAL_MS
+        }
+        if (!shouldRestart) return false
+
+        return synchronized(lifecycleLock) {
+            if (!collecting) return@synchronized false
+            synchronized(lock) {
+                restartCount++
+                lastRestartAt = now
+                squareSum = 0.0
+                sampleCount = 0L
+                peak = 0.0
+            }
+            val old = recorder
+            recorder = null
+            stopAndRelease(old)
+            val restarted = createAndStartRecorder()
+            if (!restarted) {
+                synchronized(lock) {
+                    deviceName = "AudioRecord 重启失败"
+                }
+            }
+            restarted
+        }
+    }
+
+    fun stop() = synchronized(lifecycleLock) {
+        collecting = false
+        val current = recorder
+        recorder = null
+        stopAndRelease(current)
+        synchronized(lock) {
+            squareSum = 0.0
+            sampleCount = 0L
+            peak = 0.0
+            deviceName = "已停止"
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun createAndStartRecorder(): Boolean {
         val minimum = AudioRecord.getMinBufferSize(
-            sampleRate,
+            SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
         )
         if (minimum <= 0) return false
+
         val audioRecord = createRecorder(MediaRecorder.AudioSource.UNPROCESSED, minimum)
             ?: createRecorder(MediaRecorder.AudioSource.MIC, minimum)
             ?: return false
-        if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
+        return try {
+            audioRecord.startRecording()
+            if (audioRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                audioRecord.release()
+                false
+            } else {
+                recorder = audioRecord
+                synchronized(lock) {
+                    deviceName = routedDeviceName(audioRecord)
+                }
+                thread(name = "metro-audio", isDaemon = true) { readLoop(audioRecord) }
+                true
+            }
+        } catch (_: IllegalStateException) {
             audioRecord.release()
-            return false
+            false
+        } catch (_: SecurityException) {
+            audioRecord.release()
+            false
         }
-        recorder = audioRecord
-        running = true
-        audioRecord.startRecording()
-        thread(name = "metro-audio", isDaemon = true) { readLoop(audioRecord) }
-        return true
     }
 
     @SuppressLint("MissingPermission")
     private fun createRecorder(source: Int, minimum: Int): AudioRecord? = try {
         val candidate = AudioRecord(
             source,
-            sampleRate,
+            SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
             maxOf(minimum, 4096),
         )
-        if (candidate.state == AudioRecord.STATE_INITIALIZED) candidate
-        else {
+        if (candidate.state == AudioRecord.STATE_INITIALIZED) {
+            candidate
+        } else {
             candidate.release()
             null
         }
@@ -72,24 +195,62 @@ class AudioCollector {
 
     private fun readLoop(audioRecord: AudioRecord) {
         val buffer = ShortArray(2048)
-        while (running) {
-            val count = audioRecord.read(buffer, 0, buffer.size)
-            if (count <= 0) continue
+        while (collecting && recorder === audioRecord) {
+            val count = try {
+                audioRecord.read(buffer, 0, buffer.size)
+            } catch (_: Exception) {
+                break
+            }
+            if (count <= 0) {
+                if (
+                    count == AudioRecord.ERROR_DEAD_OBJECT ||
+                    count == AudioRecord.ERROR_INVALID_OPERATION ||
+                    count == AudioRecord.ERROR_BAD_VALUE
+                ) {
+                    if (recorder === audioRecord) {
+                        recorder = null
+                        stopAndRelease(audioRecord)
+                    }
+                    break
+                }
+                continue
+            }
             synchronized(lock) {
                 for (i in 0 until count) {
                     val normalized = buffer[i] / 32768.0
                     squareSum += normalized * normalized
                     sampleCount++
-                    peak = maxOf(peak, kotlin.math.abs(normalized))
+                    peak = maxOf(peak, abs(normalized))
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    val routed = audioRecord.routedDevice
-                    deviceName = routed?.productName?.toString()
-                        ?.let { "$it (${deviceTypeName(routed.type)})" }
-                        ?: "系统默认输入"
-                }
+                deviceName = routedDeviceName(audioRecord)
             }
         }
+    }
+
+    private fun routedDeviceName(audioRecord: AudioRecord): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return "系统默认输入"
+        val routed = audioRecord.routedDevice
+        return routed?.productName?.toString()
+            ?.let { "$it (${deviceTypeName(routed.type)})" }
+            ?: "系统默认输入"
+    }
+
+    private fun audioRecordState(): String {
+        val current = recorder ?: return if (collecting) "UNAVAILABLE" else "STOPPED"
+        return when {
+            current.state != AudioRecord.STATE_INITIALIZED -> "UNINITIALIZED"
+            current.recordingState == AudioRecord.RECORDSTATE_RECORDING -> "RECORDING"
+            current.recordingState == AudioRecord.RECORDSTATE_STOPPED -> "STOPPED"
+            else -> "INITIALIZED"
+        }
+    }
+
+    private fun stopAndRelease(audioRecord: AudioRecord?) {
+        try {
+            audioRecord?.stop()
+        } catch (_: Exception) {
+        }
+        audioRecord?.release()
     }
 
     private fun deviceTypeName(type: Int): String = when (type) {
@@ -101,31 +262,5 @@ class AudioCollector {
         AudioDeviceInfo.TYPE_BLE_HEADSET -> "蓝牙"
         AudioDeviceInfo.TYPE_WIRED_HEADSET -> "有线耳机"
         else -> "类型$type"
-    }
-
-    fun takeSnapshot(): AudioSnapshot = synchronized(lock) {
-        val rms = if (sampleCount > 0) sqrt(squareSum / sampleCount) else 0.0
-        val result = AudioSnapshot(
-            active = running,
-            valid = running && sampleCount > 0,
-            rms = rms,
-            peak = peak,
-            inputDevice = deviceName,
-        )
-        squareSum = 0.0
-        sampleCount = 0
-        peak = 0.0
-        result
-    }
-
-    fun stop() {
-        running = false
-        val current = recorder
-        recorder = null
-        try {
-            current?.stop()
-        } catch (_: Exception) {
-        }
-        current?.release()
     }
 }
