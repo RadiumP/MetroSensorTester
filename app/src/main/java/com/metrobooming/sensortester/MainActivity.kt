@@ -186,6 +186,13 @@ class MainActivity : Activity() {
         valuesText.text = buildString {
             appendLine("列车状态    : ${inferred?.trainState ?: "等待"}")
             appendLine("玩家状态    : ${inferred?.playerState ?: "等待"}")
+            appendLine(
+                "罗盘方位    : ${formatHeading(sensor?.compassHeadingDeg)} " +
+                    "${sensor?.compassDirection.orEmpty()}（${sensor?.compassReference ?: "不可用"}）"
+            )
+            appendLine("磁北方位    : ${formatHeading(sensor?.compassMagneticAzimuthDeg)}")
+            appendLine("真北方位    : ${formatHeading(sensor?.compassTrueAzimuthDeg)}")
+            appendLine("罗盘状态    : ${sensor?.compassSource ?: "不可用"} · ${sensor?.compassAccuracyLabel ?: "未知"} · ${sensor?.compassCalibration ?: "未知"} · ${sensor?.magneticDisturbance ?: "未知"}")
             appendLine("麦克风状态  : ${mic?.quality ?: "未启动"}")
             appendLine("麦克风 RMS : ${format(mic?.rms, 6)}")
             appendLine("输入设备    : ${mic?.inputDevice ?: "未启动"}")
@@ -222,6 +229,9 @@ class MainActivity : Activity() {
         ) {
             missing += Manifest.permission.POST_NOTIFICATIONS
         }
+        if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            missing += Manifest.permission.ACCESS_COARSE_LOCATION
+        }
 
         if (missing.isEmpty()) {
             startRecording()
@@ -254,6 +264,12 @@ class MainActivity : Activity() {
             ).show()
         }
         startRecording()
+        if (
+            checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            Toast.makeText(this, "未授予位置权限：罗盘仍使用磁北，真北暂不可用", Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun startRecording() {
@@ -354,6 +370,9 @@ class MainActivity : Activity() {
 
     private fun format(value: Double?, decimals: Int): String =
         value?.let { "%.${decimals}f".format(Locale.US, it) } ?: "不支持"
+
+    private fun formatHeading(value: Double?): String =
+        value?.let { "%.1f°".format(Locale.US, it) } ?: "不可用"
 
     private fun formatElapsed(ms: Long): String {
         val totalSeconds = ms / 1000
