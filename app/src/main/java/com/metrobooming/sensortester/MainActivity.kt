@@ -203,6 +203,28 @@ class MainActivity : Activity() {
             appendLine("阈值模式    : ${inferred?.thresholdMode ?: "固定"}")
             appendLine("Audio重启   : ${mic?.restartCount ?: 0} 次")
             appendLine("Audio状态   : ${mic?.audioRecordState ?: "STOPPED"}")
+            val silencedText = when (mic?.clientSilenced) {
+                true -> "是（系统/并发策略）"
+                false -> "否"
+                null -> "未知"
+            }
+            appendLine("系统静音    : $silencedText")
+            appendLine(
+                "Audio源     : ${mic?.audioSource ?: "未启动"} · " +
+                    "session ${mic?.audioSessionId ?: "-"}"
+            )
+            appendLine(
+                "读取统计    : ${mic?.readCount ?: 0}次 / ${mic?.samplesRead ?: 0}样本 / " +
+                    "零样本 ${formatPercent(mic?.zeroSampleRatio)}"
+            )
+            appendLine(
+                "录音配置    : ${mic?.activeRecordingConfigCount ?: 0}个 · " +
+                    "路由变化 ${mic?.routeChangeCount ?: 0}次"
+            )
+            appendLine(
+                "读取结果    : ${mic?.lastReadResult ?: "-"} · ${mic?.readError ?: "NONE"}"
+            )
+            appendLine("重启原因    : ${mic?.restartReason ?: "无"}")
             appendLine(
                 "前台服务    : ${if (status.foregroundServiceActive) "运行中" else "已停止"}"
             )
@@ -373,6 +395,9 @@ class MainActivity : Activity() {
 
     private fun formatHeading(value: Double?): String =
         value?.let { "%.1f°".format(Locale.US, it) } ?: "不可用"
+
+    private fun formatPercent(value: Double?): String =
+        value?.let { "%.1f%%".format(Locale.US, it * 100.0) } ?: "未知"
 
     private fun formatElapsed(ms: Long): String {
         val totalSeconds = ms / 1000

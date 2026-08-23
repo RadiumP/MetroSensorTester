@@ -66,6 +66,10 @@ class RecordingService : Service() {
             "compass_heading_deg", "compass_direction", "compass_reference",
             "compass_accuracy", "compass_accuracy_label", "compass_calibration",
             "magnetic_disturbance", "magnetic_declination_deg", "compass_location_age_ms",
+            "audio_client_silenced", "audio_session_id", "audio_source",
+            "audio_read_count", "audio_samples_read", "audio_zero_sample_ratio",
+            "audio_last_read_result", "audio_read_error", "active_recording_config_count",
+            "audio_route_change_count", "audio_restart_reason",
             "mark", "segment_id", "device_model", "android_version",
         )
     }
@@ -76,7 +80,7 @@ class RecordingService : Service() {
 
     private val binder = LocalBinder()
     private val handler = Handler(Looper.getMainLooper())
-    private val audio = AudioCollector()
+    private lateinit var audio: AudioCollector
     private val inference = InferenceEngine()
     private val rows = mutableListOf<List<Any?>>()
     private val rowLock = Any()
@@ -105,6 +109,7 @@ class RecordingService : Service() {
         sensors = SensorCollector(this)
         powerManager = getSystemService(POWER_SERVICE) as PowerManager
         createNotificationChannel()
+        audio = AudioCollector(this)
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -226,7 +231,7 @@ class RecordingService : Service() {
                 if (sensor.pressureHpa != null) 1 else 0, sensor.pressureHpa,
                 if (mic.active) 1 else 0, if (mic.valid) 1 else 0,
                 mic.rms, mic.peak, mic.inputDevice,
-                4, inferred.rawState, inferred.state,
+                5, inferred.rawState, inferred.state,
                 inferred.rawTrainState, inferred.trainState,
                 inferred.playerState,
                 if (inferred.trainState == "运行") 1 else 0,
@@ -264,6 +269,17 @@ class RecordingService : Service() {
                 sensor.magneticDisturbance,
                 sensor.magneticDeclinationDeg,
                 sensor.compassLocationAgeMs,
+                mic.clientSilenced?.let { if (it) 1 else 0 },
+                mic.audioSessionId,
+                mic.audioSource,
+                mic.readCount,
+                mic.samplesRead,
+                mic.zeroSampleRatio,
+                mic.lastReadResult,
+                mic.readError,
+                mic.activeRecordingConfigCount,
+                mic.routeChangeCount,
+                mic.restartReason,
                 currentMark, segmentId,
                 Build.MODEL, Build.VERSION.RELEASE,
             )

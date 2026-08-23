@@ -10,11 +10,12 @@
 - 陀螺仪、磁力计原始 XYZ 与磁场强度、气压计
 - Android `AudioRecord` 麦克风 RMS、峰值、输入设备与录音状态
 - PCM 近零异常检测、1 秒恢复确认和限频安全重启
+- 检测 Android 音频框架系统静音，并记录 AudioRecord 读取与路由诊断
 - 固定三区间迟滞启动，并使用最近 3 分钟有效数据平滑生成动态阈值
 - 列车运行/停站与玩家活动独立判断
 - 前台服务、常驻通知和 PARTIAL_WAKE_LOCK 后台采集
 - 人工标记运行和停站
-- 使用系统文件选择器导出 UTF-8 CSV（状态字段 schema v4，保留旧字段并追加罗盘字段）
+- 使用系统文件选择器导出 UTF-8 CSV（状态字段 schema v5，保留旧字段并追加罗盘/音频诊断字段）
 
 ## 打开与运行
 
@@ -40,6 +41,10 @@
 - 近零持续 2 秒后写入 `mic_valid=0` 和 `mic_quality=全零异常`。
 - 恢复非零音频连续 1 秒后重新有效。
 - 异常持续时 AudioRecord 最早每 15 秒安全重启一次，并记录 `mic_restart_count`。
+- 若 `audio_client_silenced=1`，说明 Android 因后台或并发录音策略主动静音客户端；此时保持列车状态且不反复无效重启。
+- 若未被系统静音但持续零 PCM，重启时从 `UNPROCESSED` 回退到普通 `MIC` 音源。
+- `audio_samples_read` 与 `audio_zero_sample_ratio` 用于区分“没有读到数据”和“确实读到了全零 PCM”。
+- CSV 同时记录录音 session、音源、read 返回值/错误、活跃录音配置数、路由变化和重启原因。
 
 ## 罗盘辅助
 
