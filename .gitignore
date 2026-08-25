@@ -7,3 +7,6 @@ app/build/
 captures/
 .externalNativeBuild/
 .cxx/
+
+# Godot (godot-link-test/) editor cache/import data
+.godot/

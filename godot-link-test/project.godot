@@ -17,3 +17,7 @@ config/features=PackedStringArray("4.7")
 [network]
 
 limits/tcp/connect_timeout_seconds=3
+
+[rendering]
+
+textures/vram_compression/import_etc2_astc=true
