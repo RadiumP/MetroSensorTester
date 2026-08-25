@@ -19,6 +19,10 @@ data class InferenceResult(
     val effectiveStopThreshold: Double,
     val effectiveMovingThreshold: Double,
     val thresholdMode: String,
+    // Despite the field names (kept for CSV schema stability), these are no
+    // longer a combined-history P25/P70: micP25 is the P75 of recent "停站"-only
+    // samples and micP70 is the P25 of recent "运行"-only samples -- the raw
+    // percentiles the dynamic thresholds below are derived from.
     val micP25: Double?,
     val micP70: Double?,
     val validMicSampleCount: Int,
@@ -270,17 +274,27 @@ class InferenceEngine {
             return
         }
 
-        val movingCount = micHistory.count { it.trainState == STATE_MOVING }
-        val stoppedCount = micHistory.count { it.trainState == STATE_STOPPED }
-        if (movingCount < MIN_SAMPLES_PER_STATE || stoppedCount < MIN_SAMPLES_PER_STATE) {
+        // Percentiles are computed separately within each train-state label.
+        // Sorting the combined history and taking one global P25/P70 (the old
+        // approach) let whichever state had more samples in the last 3 minutes
+        // dominate the split point: a long station dwell (mostly "停站" samples)
+        // could push the "运行" threshold down toward ordinary stop-noise levels,
+        // making loud-but-stationary noise (crowded platform, announcements) read
+        // as the train moving. Deriving each threshold only from its own label's
+        // samples keeps it anchored to that state's actual noise level regardless
+        // of how the two populations are split in the window.
+        val stoppedRms = micHistory.mapNotNull { if (it.trainState == STATE_STOPPED) it.rms else null }
+            .sorted()
+        val movingRms = micHistory.mapNotNull { if (it.trainState == STATE_MOVING) it.rms else null }
+            .sorted()
+        if (stoppedRms.size < MIN_SAMPLES_PER_STATE || movingRms.size < MIN_SAMPLES_PER_STATE) {
             return
         }
 
-        val sorted = micHistory.map { it.rms }.sorted()
-        val p25 = percentile(sorted, 0.25)
-        val p70 = percentile(sorted, 0.70)
-        var targetStop = p25.coerceIn(MIN_STOP_THRESHOLD, MAX_STOP_THRESHOLD)
-        var targetMoving = p70.coerceIn(MIN_MOVING_THRESHOLD, MAX_MOVING_THRESHOLD)
+        val p75Stopped = percentile(stoppedRms, 0.75)
+        val p25Moving = percentile(movingRms, 0.25)
+        var targetStop = p75Stopped.coerceIn(MIN_STOP_THRESHOLD, MAX_STOP_THRESHOLD)
+        var targetMoving = p25Moving.coerceIn(MIN_MOVING_THRESHOLD, MAX_MOVING_THRESHOLD)
 
         if (targetMoving - targetStop < MIN_HYSTERESIS_GAP) {
             targetMoving = (targetStop + MIN_HYSTERESIS_GAP)
@@ -291,16 +305,14 @@ class InferenceEngine {
             }
         }
 
-        dynamicStopThreshold = smooth(
-            dynamicStopThreshold ?: MIC_STOP_RMS_THRESHOLD,
-            targetStop,
-        )
-        dynamicMovingThreshold = smooth(
-            dynamicMovingThreshold ?: MIC_MOVING_RMS_THRESHOLD,
-            targetMoving,
-        )
-        lastP25 = p25
-        lastP70 = p70
+        // On first activation there's nothing to smooth from yet, so jump straight
+        // to the computed value instead of easing 8% of the way from the fixed
+        // default every 5s (which took over a minute to become meaningfully
+        // different from the fixed thresholds it's replacing).
+        dynamicStopThreshold = dynamicStopThreshold?.let { smooth(it, targetStop) } ?: targetStop
+        dynamicMovingThreshold = dynamicMovingThreshold?.let { smooth(it, targetMoving) } ?: targetMoving
+        lastP25 = p75Stopped
+        lastP70 = p25Moving
         lastThresholdUpdateAt = now
     }
 

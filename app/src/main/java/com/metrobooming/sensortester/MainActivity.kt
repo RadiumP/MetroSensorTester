@@ -14,6 +14,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -163,7 +164,10 @@ class MainActivity : Activity() {
         val mic = status.audio
         val sensor = status.sensor
         val elapsed = if (status.recording) {
-            System.currentTimeMillis() - status.startedAt
+            // status.startedAt is elapsedRealtime-based (see RecordingService) so this
+            // stays correct even if the phone's wall clock jumps (e.g. re-syncing after
+            // losing signal in a tunnel).
+            SystemClock.elapsedRealtime() - status.startedAt
         } else {
             0L
         }

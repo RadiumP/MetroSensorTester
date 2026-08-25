@@ -154,4 +154,52 @@ class InferenceEngineTest {
         assertEquals(frozen.dynamicStopThreshold, stillFrozen.dynamicStopThreshold)
         assertEquals(frozen.dynamicMovingThreshold, stillFrozen.dynamicMovingThreshold)
     }
+
+    @Test
+    fun dynamicMovingThresholdStaysAnchoredToMovingSamplesUnderSkewedHistory() {
+        // Regression test: a long station dwell can fill the 3-minute history
+        // with far more "停站" samples than "运行" samples, some of them loud
+        // (crowded platform, announcements) but still genuinely stationary. If
+        // thresholds were derived from one combined-history percentile, this
+        // stopped-heavy skew would drag the moving threshold down toward
+        // ordinary stop noise, making loud-but-stopped samples misread as
+        // moving. Per-state percentiles must keep the moving threshold
+        // anchored to the (small) population of genuinely moving samples.
+        val engine = InferenceEngine()
+        var now = 0L
+
+        engine.update(0.0009, true, 0.1, 1.0, now)
+        now += InferenceEngine.STOP_CONFIRMATION_MS
+        engine.update(0.0009, true, 0.1, 1.0, now)
+
+        // 700 "停站" samples: mostly quiet, ~10% loud platform noise -- but
+        // always below the fixed moving threshold (0.0018) so the state never
+        // flips while this history is being built.
+        repeat(700) { index ->
+            now += 250L
+            val rms = if (index % 10 == 0) 0.0017 else 0.0009
+            engine.update(rms, true, 0.1, 1.0, now)
+        }
+
+        // A short, tightly-clustered burst of genuine moving noise: just
+        // enough samples (>= MIN_SAMPLES_PER_STATE) to unlock dynamic mode.
+        now += 250L
+        engine.update(0.0019, true, 0.1, 1.0, now)
+        now += InferenceEngine.MOVING_CONFIRMATION_MS
+        var result: InferenceResult? = null
+        repeat(24) {
+            now += 250L
+            result = engine.update(0.0019, true, 0.1, 1.0, now)
+        }
+
+        val dynamic = requireNotNull(result)
+        assertEquals("动态", dynamic.thresholdMode)
+        // The 700 quiet/loud-but-stopped samples outnumber the 25 moving
+        // samples roughly 28:1. A combined-history percentile would have
+        // computed the moving split point from the stopped population and
+        // clamped it down to MIN_MOVING_THRESHOLD (0.0016) -- below the fixed
+        // default. The per-state P25-of-moving-only calculation must instead
+        // stay at or above the genuine moving noise level.
+        assertTrue(dynamic.effectiveMovingThreshold >= InferenceEngine.MIC_MOVING_RMS_THRESHOLD)
+    }
 }

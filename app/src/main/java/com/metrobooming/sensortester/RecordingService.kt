@@ -13,6 +13,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import java.time.Instant
 import java.util.Locale
 import kotlin.math.PI
@@ -82,6 +83,7 @@ class RecordingService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var audio: AudioCollector
     private val inference = InferenceEngine()
+    private val gameLink = GameLinkServer()
     private val rows = mutableListOf<List<Any?>>()
     private val rowLock = Any()
 
@@ -110,6 +112,9 @@ class RecordingService : Service() {
         powerManager = getSystemService(POWER_SERVICE) as PowerManager
         createNotificationChannel()
         audio = AudioCollector(this)
+        // Listens for the whole service lifetime, not just while recording, so a
+        // companion game can connect and wait before the user presses "start".
+        gameLink.start()
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -178,6 +183,7 @@ class RecordingService : Service() {
             audio.stop()
         }
         releaseWakeLock()
+        gameLink.stop()
         super.onDestroy()
     }
 
@@ -187,7 +193,11 @@ class RecordingService : Service() {
         inference.reset()
         currentMark = ""
         segmentId = 0
-        startedAt = System.currentTimeMillis()
+        // elapsedRealtime, not currentTimeMillis: the wall clock can jump when the
+        // phone re-syncs after losing signal in a tunnel, which would otherwise make
+        // every downstream timer (state confirmation, mic recovery, dynamic
+        // thresholds) see a bogus elapsed duration.
+        startedAt = SystemClock.elapsedRealtime()
         lastNotificationAt = 0L
         acquireWakeLock()
         sensors.start()
@@ -207,7 +217,12 @@ class RecordingService : Service() {
     private val tick = object : Runnable {
         override fun run() {
             if (!recording) return
-            val now = System.currentTimeMillis()
+            // now drives every inference/recovery timer below, so it must be
+            // monotonic and immune to wall-clock jumps (NTP re-sync after a tunnel,
+            // manual time changes, etc). wallClockNow is only for the human-readable
+            // "ts" column.
+            val now = SystemClock.elapsedRealtime()
+            val wallClockNow = System.currentTimeMillis()
             val sensor = sensors.takeSnapshot()
             val mic = audio.takeSnapshot(now)
             audio.restartIfNeeded(now)
@@ -222,8 +237,17 @@ class RecordingService : Service() {
             )
             val screenOn = powerManager.isInteractive
             val wakeLockHeld = wakeLock?.isHeld == true
+            gameLink.broadcastState(
+                elapsedMs = now - startedAt,
+                trainState = inferred.trainState,
+                trainMoving = inferred.trainState == "运行",
+                playerActive = inferred.playerActive,
+                micLevelRatio = inferred.micLevelRatio,
+                accelRms = sensor.accelRms,
+                gyroRmsDegS = gyroRmsDeg,
+            )
             val row = listOf(
-                Instant.ofEpochMilli(now).toString(), now - startedAt,
+                Instant.ofEpochMilli(wallClockNow).toString(), now - startedAt,
                 sensor.accelRms, sensor.accelPeak,
                 gyroRmsDeg, gyroPeakDeg, sensor.gyroX, sensor.gyroY, sensor.gyroZ,
                 if (sensor.magnetMagnitude != null) 1 else 0,

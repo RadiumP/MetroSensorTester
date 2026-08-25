@@ -9,6 +9,7 @@ import android.media.AudioRecord
 import android.media.AudioRecordingConfiguration
 import android.media.MediaRecorder
 import android.os.Build
+import android.os.SystemClock
 import kotlin.concurrent.thread
 import kotlin.math.abs
 import kotlin.math.sqrt
@@ -84,7 +85,10 @@ class AudioCollector(context: Context) {
             peak = 0.0
             latestQuality = qualityMonitor.reset()
             restartCount = 0
-            lastRestartAt = System.currentTimeMillis()
+            // Must match the elapsedRealtime clock RecordingService passes into
+            // restartIfNeeded(now); currentTimeMillis() here would desync the
+            // restart cooldown whenever the wall clock jumps.
+            lastRestartAt = SystemClock.elapsedRealtime()
             sourceMode = AudioSourceMode.UNPROCESSED
             latestClientSilenced = null
             readCount = 0L
