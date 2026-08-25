@@ -14,6 +14,12 @@ config/name="MetroLinkTest"
 run/main_scene="res://Main.tscn"
 config/features=PackedStringArray("4.7")
 
+[display]
+
+window/size/viewport_width=1080
+window/size/viewport_height=1920
+window/handheld/orientation=1
+
 [network]
 
 limits/tcp/connect_timeout_seconds=3
