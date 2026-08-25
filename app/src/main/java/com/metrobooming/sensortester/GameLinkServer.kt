@@ -54,7 +54,13 @@ class GameLinkServer {
         synchronized(lock) {
             if (serverSocket != null) return
             serverSocket = try {
-                ServerSocket(PORT, 4, InetAddress.getLoopbackAddress())
+                // Bind explicitly to the IPv4 loopback literal. getLoopbackAddress()
+                // can resolve to the IPv6 loopback (::1) on some devices, which a
+                // client dialing the literal "127.0.0.1" (like Godot's
+                // StreamPeerTCP.connect_to_host) can never reach -- the OS returns
+                // an instant connection-refused RST for that exact address:port,
+                // even though a server actually is listening one address family over.
+                ServerSocket(PORT, 4, InetAddress.getByName("127.0.0.1"))
             } catch (e: Exception) {
                 // Port already taken by another instance, or sockets unavailable --
                 // the game link is a nice-to-have, never fail recording over it.
