@@ -59,6 +59,7 @@ class RecordingService : Service() {
             "mic_dynamic_stop_threshold", "mic_dynamic_moving_threshold",
             "mic_effective_stop_threshold", "mic_effective_moving_threshold",
             "mic_threshold_mode", "mic_p25", "mic_p70", "mic_valid_history_size",
+            "mic_crest_factor", "mic_chime_candidate",
             "moving_confirmation_ms", "moving_candidate_elapsed_ms",
             "app_in_foreground", "screen_on", "wake_lock_held",
             "audio_record_state", "foreground_service_active",
@@ -231,6 +232,7 @@ class RecordingService : Service() {
             val inferred = inference.update(
                 mic.rms,
                 mic.valid,
+                mic.peak,
                 sensor.accelRms,
                 gyroRmsDeg,
                 now,
@@ -273,6 +275,7 @@ class RecordingService : Service() {
                 inferred.effectiveStopThreshold, inferred.effectiveMovingThreshold,
                 inferred.thresholdMode, inferred.micP25, inferred.micP70,
                 inferred.validMicSampleCount,
+                inferred.micCrestFactor, if (inferred.micChimeCandidate) 1 else 0,
                 InferenceEngine.MOVING_CONFIRMATION_MS,
                 inferred.movingCandidateElapsedMs,
                 if (appInForeground) 1 else 0,

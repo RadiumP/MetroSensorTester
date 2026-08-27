@@ -38,6 +38,7 @@ class MainActivity : Activity() {
     private var recordingService: RecordingService? = null
     private var serviceBound = false
     private var pendingCsv: String? = null
+    private var broadcastMarkCount = 0
 
     private lateinit var statusText: TextView
     private lateinit var valuesText: TextView
@@ -118,8 +119,7 @@ class MainActivity : Activity() {
         root.addView(controls)
 
         val labels = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        labels.addView(button("停站") { setMark("停站") }, weighted())
-        labels.addView(button("运行") { setMark("运行") }, weighted())
+        labels.addView(button("广播") { markBroadcastHeard() }, weighted())
         labels.addView(button("清除标记") { setMark("") }, weighted())
         root.addView(labels)
 
@@ -299,6 +299,7 @@ class MainActivity : Activity() {
     }
 
     private fun startRecording() {
+        broadcastMarkCount = 0
         val intent = Intent(this, RecordingService::class.java).apply {
             action = RecordingService.ACTION_START
         }
@@ -318,6 +319,20 @@ class MainActivity : Activity() {
     private fun setMark(mark: String) {
         recordingService?.setMark(mark)
         updateUi()
+    }
+
+    // One button for both entering and leaving a station: the fixed
+    // announcement chime plays at both moments, so the tester just presses
+    // this the instant they hear it, regardless of direction. Each press
+    // gets its own number (rather than reusing the same "广播" string) so
+    // repeated presses each land as a distinct, separately-timestamped mark
+    // in the CSV instead of being swallowed by RecordingService.setMark()'s
+    // "only bump segment_id when the mark actually changes" check -- these
+    // are meant as ground-truth timestamps to check mic_chime_candidate
+    // against, not a persistent state label.
+    private fun markBroadcastHeard() {
+        broadcastMarkCount++
+        setMark("广播$broadcastMarkCount")
     }
 
     private fun exportCsv() {

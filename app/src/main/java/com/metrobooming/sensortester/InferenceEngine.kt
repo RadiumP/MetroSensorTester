@@ -26,6 +26,14 @@ data class InferenceResult(
     val micP25: Double?,
     val micP70: Double?,
     val validMicSampleCount: Int,
+    // Cheap "did we maybe just hear the fixed station announcement chime"
+    // signal: a station announcement is loud but brief, so it barely moves
+    // the windowed RMS average while still producing a sharp instantaneous
+    // peak -- i.e. an abnormally high peak/rms ratio for that tick. This is
+    // logged for field-testing only; it does not currently feed into the
+    // train-state decision above.
+    val micCrestFactor: Double,
+    val micChimeCandidate: Boolean,
     val reason: String,
 )
 
@@ -39,6 +47,15 @@ class InferenceEngine {
 
         const val PLAYER_ACCEL_RMS_THRESHOLD = 0.40
         const val PLAYER_GYRO_RMS_THRESHOLD_DEG_S = 15.0
+
+        // A tick's peak/rms ratio ("crest factor") is normally ~2.3-4.5 for
+        // ordinary train/cabin noise (checked against real ride recordings).
+        // The fixed station announcement chime is short enough that it barely
+        // raises the windowed RMS average while still spiking the peak, so a
+        // much higher ratio is the cheap tell -- no new audio processing
+        // needed, mic_peak/mic_rms are already collected every tick.
+        const val MIC_CHIME_CREST_FACTOR_THRESHOLD = 8.0
+        const val MIC_CHIME_MIN_PEAK = 0.008
 
         private const val DYNAMIC_HISTORY_MS = 180_000L
         private const val MIN_DYNAMIC_SAMPLES = 240
@@ -86,6 +103,7 @@ class InferenceEngine {
     fun update(
         micRms: Double,
         micValid: Boolean,
+        micPeak: Double,
         accelRms: Double,
         gyroDegreesRms: Double,
         now: Long,
@@ -95,6 +113,10 @@ class InferenceEngine {
             purgeOldMicSamples(now)
             maybeUpdateDynamicThresholds(now)
         }
+        val micCrestFactor = if (micUsable) micPeak / micRms else 0.0
+        val micChimeCandidate = micUsable &&
+            micPeak >= MIC_CHIME_MIN_PEAK &&
+            micCrestFactor >= MIC_CHIME_CREST_FACTOR_THRESHOLD
 
         val effectiveStopThreshold = dynamicStopThreshold ?: MIC_STOP_RMS_THRESHOLD
         val effectiveMovingThreshold = dynamicMovingThreshold ?: MIC_MOVING_RMS_THRESHOLD
@@ -132,6 +154,8 @@ class InferenceEngine {
                 micBelowStopThreshold = false,
                 stopCandidateElapsedMs = 0L,
                 movingCandidateElapsedMs = 0L,
+                micCrestFactor = micCrestFactor,
+                micChimeCandidate = micChimeCandidate,
                 reason = if (micValid) "mic-zero-hold-state" else "mic-invalid-hold-state",
             )
         }
@@ -209,6 +233,8 @@ class InferenceEngine {
             micBelowStopThreshold = micBelowStopThreshold,
             stopCandidateElapsedMs = stopCandidateElapsedMs,
             movingCandidateElapsedMs = movingCandidateElapsedMs,
+            micCrestFactor = micCrestFactor,
+            micChimeCandidate = micChimeCandidate,
             reason = reason,
         )
     }
@@ -226,6 +252,8 @@ class InferenceEngine {
         micBelowStopThreshold: Boolean,
         stopCandidateElapsedMs: Long,
         movingCandidateElapsedMs: Long,
+        micCrestFactor: Double,
+        micChimeCandidate: Boolean,
         reason: String,
     ): InferenceResult {
         val state = combinedState(stableTrainState, playerActive)
@@ -257,6 +285,8 @@ class InferenceEngine {
             micP25 = lastP25,
             micP70 = lastP70,
             validMicSampleCount = micHistory.size,
+            micCrestFactor = micCrestFactor,
+            micChimeCandidate = micChimeCandidate,
             reason = finalReason,
         )
     }
