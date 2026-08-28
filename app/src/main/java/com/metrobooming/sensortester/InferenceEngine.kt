@@ -34,6 +34,18 @@ data class InferenceResult(
     // train-state decision above.
     val micCrestFactor: Double,
     val micChimeCandidate: Boolean,
+    // Alternate cheap "did we maybe just hear a fixed announcement/alarm"
+    // signal, aimed at sounds too sustained for the peak/rms crest factor
+    // above to catch (a spoken station announcement raises the whole
+    // windowed RMS rather than spiking the peak): compares this tick's RMS
+    // to the median RMS from a few seconds earlier. Also logged only, not
+    // yet used by the train-state decision. Field-test note: this only
+    // shows a bump while the recent baseline itself was quiet -- once the
+    // train is already loud (moving), both this and the announcement/alarm
+    // sound get buried in ambient noise and the ratio stays ~1.0x.
+    val micBaselineRms: Double?,
+    val micRmsBumpRatio: Double,
+    val micRmsBumpCandidate: Boolean,
     val reason: String,
 )
 
@@ -57,6 +69,20 @@ class InferenceEngine {
         const val MIC_CHIME_CREST_FACTOR_THRESHOLD = 8.0
         const val MIC_CHIME_MIN_PEAK = 0.008
 
+        // Baseline-bump detector: compares each tick's RMS against the
+        // median RMS from MIC_BUMP_GAP_MS..MIC_BUMP_LOOKBACK_MS ago (the gap
+        // excludes the second or so right before "now" so a sound that
+        // started slightly early doesn't leak into its own baseline).
+        // Real-ride field test (2026-08-28): a quiet-baseline announcement
+        // or door-alarm produced a 1.5x-3.3x bump; 1.8x sits below all of
+        // those while still comfortably above ordinary tick-to-tick RMS
+        // jitter. Not tuned much beyond that -- expect to revisit once more
+        // field data comes in.
+        const val MIC_BUMP_LOOKBACK_MS = 6_000L
+        const val MIC_BUMP_GAP_MS = 1_000L
+        const val MIC_BUMP_MIN_BASELINE_SAMPLES = 8
+        const val MIC_BUMP_RATIO_THRESHOLD = 1.8
+
         private const val DYNAMIC_HISTORY_MS = 180_000L
         private const val MIN_DYNAMIC_SAMPLES = 240
         private const val MIN_SAMPLES_PER_STATE = 20
@@ -77,8 +103,14 @@ class InferenceEngine {
     }
 
     private data class MicPoint(val timestampMs: Long, val rms: Double, val trainState: String)
+    private data class RecentMicSample(val timestampMs: Long, val rms: Double)
 
     private val micHistory = ArrayDeque<MicPoint>()
+    // Short rolling window feeding the baseline-bump detector -- separate
+    // from micHistory above, which only keeps samples once the train state
+    // is stable and is used for the (much longer, 3-minute) dynamic
+    // threshold calculation instead.
+    private val recentMicSamples = ArrayDeque<RecentMicSample>()
     private var stableTrainState = STATE_CALIBRATING
     private var stopCandidateSince: Long? = null
     private var movingCandidateSince: Long? = null
@@ -90,6 +122,7 @@ class InferenceEngine {
 
     fun reset() {
         micHistory.clear()
+        recentMicSamples.clear()
         stableTrainState = STATE_CALIBRATING
         stopCandidateSince = null
         movingCandidateSince = null
@@ -117,6 +150,28 @@ class InferenceEngine {
         val micChimeCandidate = micUsable &&
             micPeak >= MIC_CHIME_MIN_PEAK &&
             micCrestFactor >= MIC_CHIME_CREST_FACTOR_THRESHOLD
+
+        var micBaselineRms: Double? = null
+        var micRmsBumpRatio = 0.0
+        var micRmsBumpCandidate = false
+        if (micUsable) {
+            while (
+                recentMicSamples.firstOrNull()?.timestampMs?.let { it < now - MIC_BUMP_LOOKBACK_MS } == true
+            ) {
+                recentMicSamples.removeFirst()
+            }
+            val baselineSamples = recentMicSamples
+                .filter { it.timestampMs <= now - MIC_BUMP_GAP_MS }
+                .map { it.rms }
+                .sorted()
+            if (baselineSamples.size >= MIC_BUMP_MIN_BASELINE_SAMPLES) {
+                val baseline = percentile(baselineSamples, 0.5)
+                micBaselineRms = baseline
+                micRmsBumpRatio = if (baseline > MIC_NONZERO_FLOOR) micRms / baseline else 0.0
+                micRmsBumpCandidate = micRmsBumpRatio >= MIC_BUMP_RATIO_THRESHOLD
+            }
+            recentMicSamples.addLast(RecentMicSample(now, micRms))
+        }
 
         val effectiveStopThreshold = dynamicStopThreshold ?: MIC_STOP_RMS_THRESHOLD
         val effectiveMovingThreshold = dynamicMovingThreshold ?: MIC_MOVING_RMS_THRESHOLD
@@ -156,6 +211,9 @@ class InferenceEngine {
                 movingCandidateElapsedMs = 0L,
                 micCrestFactor = micCrestFactor,
                 micChimeCandidate = micChimeCandidate,
+                micBaselineRms = micBaselineRms,
+                micRmsBumpRatio = micRmsBumpRatio,
+                micRmsBumpCandidate = micRmsBumpCandidate,
                 reason = if (micValid) "mic-zero-hold-state" else "mic-invalid-hold-state",
             )
         }
@@ -235,6 +293,9 @@ class InferenceEngine {
             movingCandidateElapsedMs = movingCandidateElapsedMs,
             micCrestFactor = micCrestFactor,
             micChimeCandidate = micChimeCandidate,
+            micBaselineRms = micBaselineRms,
+            micRmsBumpRatio = micRmsBumpRatio,
+            micRmsBumpCandidate = micRmsBumpCandidate,
             reason = reason,
         )
     }
@@ -254,6 +315,9 @@ class InferenceEngine {
         movingCandidateElapsedMs: Long,
         micCrestFactor: Double,
         micChimeCandidate: Boolean,
+        micBaselineRms: Double?,
+        micRmsBumpRatio: Double,
+        micRmsBumpCandidate: Boolean,
         reason: String,
     ): InferenceResult {
         val state = combinedState(stableTrainState, playerActive)
@@ -287,6 +351,9 @@ class InferenceEngine {
             validMicSampleCount = micHistory.size,
             micCrestFactor = micCrestFactor,
             micChimeCandidate = micChimeCandidate,
+            micBaselineRms = micBaselineRms,
+            micRmsBumpRatio = micRmsBumpRatio,
+            micRmsBumpCandidate = micRmsBumpCandidate,
             reason = finalReason,
         )
     }
