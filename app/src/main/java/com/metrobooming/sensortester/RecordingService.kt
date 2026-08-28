@@ -61,6 +61,7 @@ class RecordingService : Service() {
             "mic_threshold_mode", "mic_p25", "mic_p70", "mic_valid_history_size",
             "mic_crest_factor", "mic_chime_candidate",
             "mic_baseline_rms", "mic_rms_bump_ratio", "mic_rms_bump_candidate",
+            "magnet_magnitude_jitter",
             "moving_confirmation_ms", "moving_candidate_elapsed_ms",
             "app_in_foreground", "screen_on", "wake_lock_held",
             "audio_record_state", "foreground_service_active",
@@ -236,6 +237,7 @@ class RecordingService : Service() {
                 mic.peak,
                 sensor.accelRms,
                 gyroRmsDeg,
+                sensor.magnetMagnitude,
                 now,
             )
             val screenOn = powerManager.isInteractive
@@ -279,6 +281,7 @@ class RecordingService : Service() {
                 inferred.micCrestFactor, if (inferred.micChimeCandidate) 1 else 0,
                 inferred.micBaselineRms, inferred.micRmsBumpRatio,
                 if (inferred.micRmsBumpCandidate) 1 else 0,
+                inferred.magnetMagnitudeJitter,
                 InferenceEngine.MOVING_CONFIRMATION_MS,
                 inferred.movingCandidateElapsedMs,
                 if (appInForeground) 1 else 0,

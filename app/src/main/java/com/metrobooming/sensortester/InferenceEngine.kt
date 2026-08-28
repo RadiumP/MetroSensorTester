@@ -46,6 +46,16 @@ data class InferenceResult(
     val micBaselineRms: Double?,
     val micRmsBumpRatio: Double,
     val micRmsBumpCandidate: Boolean,
+    // Tick-to-tick change in raw magnetometer field strength (orientation-
+    // independent -- unlike compass_heading_deg, which also picks up the
+    // phone's own rotation when the player is holding/moving it). Field
+    // test (2026-08-28) found this reads consistently lower while stopped
+    // than while moving (2.3x-4.6x higher moving, across two rides) -- a
+    // plausible read is electromagnetic interference from the traction
+    // motor while it's actually drawing power. Null when no magnetometer
+    // sample is available. Logged only; not yet used by the train-state
+    // decision.
+    val magnetMagnitudeJitter: Double?,
     val reason: String,
 )
 
@@ -119,6 +129,7 @@ class InferenceEngine {
     private var lastThresholdUpdateAt = 0L
     private var lastP25: Double? = null
     private var lastP70: Double? = null
+    private var lastMagnetMagnitude: Double? = null
 
     fun reset() {
         micHistory.clear()
@@ -131,6 +142,7 @@ class InferenceEngine {
         lastThresholdUpdateAt = 0L
         lastP25 = null
         lastP70 = null
+        lastMagnetMagnitude = null
     }
 
     fun update(
@@ -139,8 +151,16 @@ class InferenceEngine {
         micPeak: Double,
         accelRms: Double,
         gyroDegreesRms: Double,
+        magnetMagnitude: Double?,
         now: Long,
     ): InferenceResult {
+        val magnetMagnitudeJitter = if (magnetMagnitude != null && lastMagnetMagnitude != null) {
+            kotlin.math.abs(magnetMagnitude - lastMagnetMagnitude!!)
+        } else {
+            null
+        }
+        if (magnetMagnitude != null) lastMagnetMagnitude = magnetMagnitude
+
         val micUsable = micValid && micRms >= MIC_NONZERO_FLOOR
         if (micUsable) {
             purgeOldMicSamples(now)
@@ -214,6 +234,7 @@ class InferenceEngine {
                 micBaselineRms = micBaselineRms,
                 micRmsBumpRatio = micRmsBumpRatio,
                 micRmsBumpCandidate = micRmsBumpCandidate,
+                magnetMagnitudeJitter = magnetMagnitudeJitter,
                 reason = if (micValid) "mic-zero-hold-state" else "mic-invalid-hold-state",
             )
         }
@@ -296,6 +317,7 @@ class InferenceEngine {
             micBaselineRms = micBaselineRms,
             micRmsBumpRatio = micRmsBumpRatio,
             micRmsBumpCandidate = micRmsBumpCandidate,
+            magnetMagnitudeJitter = magnetMagnitudeJitter,
             reason = reason,
         )
     }
@@ -318,6 +340,7 @@ class InferenceEngine {
         micBaselineRms: Double?,
         micRmsBumpRatio: Double,
         micRmsBumpCandidate: Boolean,
+        magnetMagnitudeJitter: Double?,
         reason: String,
     ): InferenceResult {
         val state = combinedState(stableTrainState, playerActive)
@@ -354,6 +377,7 @@ class InferenceEngine {
             micBaselineRms = micBaselineRms,
             micRmsBumpRatio = micRmsBumpRatio,
             micRmsBumpCandidate = micRmsBumpCandidate,
+            magnetMagnitudeJitter = magnetMagnitudeJitter,
             reason = finalReason,
         )
     }
