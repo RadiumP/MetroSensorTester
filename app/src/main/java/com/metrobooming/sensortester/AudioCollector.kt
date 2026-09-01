@@ -267,6 +267,20 @@ class AudioCollector(context: Context) {
             maxOf(minimum, 4096),
         )
         if (candidate.state == AudioRecord.STATE_INITIALIZED) {
+            // Force capture off the phone's own microphone. Without this, Android's
+            // normal input routing prefers whatever mic-capable accessory is
+            // connected (a Bluetooth headset, wired headset with a mic, etc.),
+            // which is a much worse pickup for judging cabin/train noise. This is
+            // the same API camera apps use to avoid recording video audio through
+            // a connected headset mic. Best-effort: if no built-in mic device is
+            // reported (shouldn't happen on a phone) or the platform refuses the
+            // hint, recording still proceeds on whatever device the system picks.
+            builtInMicDevice()?.let { device ->
+                try {
+                    candidate.preferredDevice = device
+                } catch (_: Exception) {
+                }
+            }
             candidate
         } else {
             candidate.release()
@@ -274,6 +288,13 @@ class AudioCollector(context: Context) {
         }
     } catch (_: IllegalArgumentException) {
         null
+    } catch (_: SecurityException) {
+        null
+    }
+
+    private fun builtInMicDevice(): AudioDeviceInfo? = try {
+        audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+            .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
     } catch (_: SecurityException) {
         null
     }
