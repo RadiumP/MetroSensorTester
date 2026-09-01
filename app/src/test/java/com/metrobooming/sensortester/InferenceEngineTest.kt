@@ -248,4 +248,89 @@ class InferenceEngineTest {
         val resumed = engine.update(0.0022, true, 0.0, 0.1, 1.0, 47.0, 750L)
         assertEquals(1.5, requireNotNull(resumed.magnetMagnitudeJitter), 0.0001)
     }
+
+    @Test
+    fun agreeingMagnetShortensStopConfirmation() {
+        val engine = InferenceEngine()
+        var now = 0L
+        var magnet = 45.0
+
+        // Get into a stable "运行" state first so there's something to
+        // confirm a stop transition away from.
+        engine.update(0.0024, true, 0.0, 0.1, 1.0, magnet, now)
+        now += InferenceEngine.MOVING_CONFIRMATION_MS
+        engine.update(0.0024, true, 0.0, 0.1, 1.0, magnet, now)
+
+        // Mic drops below the stop threshold at t=2000ms. Magnet jitter
+        // stays small and constant (well inside the "停站" band) the whole
+        // time, so once the smoothing window fills (a few ticks in) it
+        // should read as "agree" and shorten the normal 3000ms stop
+        // confirmation to 1800ms (3000 * 0.6).
+        now += 250L
+        var result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now) // t=2000, elapsed=0
+
+        repeat(7) {
+            now += 250L
+            magnet += 0.4
+            result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
+        }
+        // t=3750, elapsed=1750 -- still short of the assisted 1800ms.
+        assertEquals(3_750L, now)
+        assertEquals("运行", result.trainState)
+
+        now += 250L
+        magnet += 0.4
+        result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
+        // t=4000, elapsed=2000 -- past the assisted 1800ms requirement
+        // (would have needed to wait until t=5000 without the assist).
+        assertEquals("agree", result.magnetAssistNote)
+        assertEquals("停站", result.trainState)
+    }
+
+    @Test
+    fun disagreeingMagnetLengthensMovingConfirmation() {
+        val engine = InferenceEngine()
+        var now = 0L
+        var magnet = 45.0
+
+        // Get into a stable "停站" state, keeping magnet jitter small and
+        // constant throughout (so its "停站"-band reading is already
+        // established once the moving candidate starts). Confirmed at
+        // t=2000 once the agreeing magnet signal kicks in (same mechanism
+        // as the test above, incidental here).
+        var result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
+        repeat(8) {
+            now += 250L
+            magnet += 0.4
+            result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
+        }
+        assertEquals(2_000L, now)
+        assertEquals("停站", result.trainState)
+
+        // Mic jumps above the moving threshold, but magnet jitter keeps
+        // reading small/constant (still "停站"), disagreeing with the new
+        // moving candidate. That should lengthen the normal 1750ms moving
+        // confirmation to 2450ms (1750 * 1.4).
+        now += 250L
+        magnet += 0.4
+        result = engine.update(0.0022, true, 0.0, 0.1, 1.0, magnet, now) // t=2250, elapsed=0
+
+        repeat(9) {
+            now += 250L
+            magnet += 0.4
+            result = engine.update(0.0022, true, 0.0, 0.1, 1.0, magnet, now)
+        }
+        // t=4500, elapsed=2250 -- would already be confirmed without the
+        // assist (past the fixed 1750ms), but the disagreeing magnet
+        // reading should still be holding it back.
+        assertEquals(4_500L, now)
+        assertEquals("disagree", result.magnetAssistNote)
+        assertEquals("停站", result.trainState)
+
+        now += 250L
+        magnet += 0.4
+        result = engine.update(0.0022, true, 0.0, 0.1, 1.0, magnet, now)
+        // t=4750, elapsed=2500 -- past the assisted 2450ms requirement.
+        assertEquals("运行", result.trainState)
+    }
 }

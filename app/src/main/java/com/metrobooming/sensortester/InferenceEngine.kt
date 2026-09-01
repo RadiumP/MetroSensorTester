@@ -56,6 +56,26 @@ data class InferenceResult(
     // sample is available. Logged only; not yet used by the train-state
     // decision.
     val magnetMagnitudeJitter: Double?,
+    // Smoothed (median over the last MAGNET_SMOOTHING_WINDOW_MS) version of
+    // magnetMagnitudeJitter above. The raw per-tick jitter overlaps too much
+    // between "运行"/"停站" to threshold directly -- across 11 real rides the
+    // moving/stopped medians separated cleanly (1.5x-5x) but the P25-moving
+    // vs P75-stopped quartiles overlapped in most of them. The windowed
+    // median is far less noisy. Null until enough samples have accumulated
+    // in the window.
+    val magnetJitterSmoothed: Double?,
+    // "运行"/"停站"/null (ambiguous, or not enough data yet) candidate
+    // reading from the magnet channel alone, using the same per-state
+    // dynamic-threshold technique as the mic channel below. This does NOT
+    // independently drive train_state -- see magnetAssistNote.
+    val magnetCandidateState: String?,
+    // Whether/how the magnet candidate above adjusted the mic-driven
+    // confirmation timer this tick: "agree" shortens the remaining
+    // confirmation time, "disagree" lengthens it, "none" leaves it
+    // unchanged (no active mic candidate this tick, or magnet has no
+    // opinion). Mic RMS stays the primary decision signal either way --
+    // this only nudges how fast/cautiously it gets to act.
+    val magnetAssistNote: String,
     val reason: String,
 )
 
@@ -93,6 +113,44 @@ class InferenceEngine {
         const val MIC_BUMP_MIN_BASELINE_SAMPLES = 8
         const val MIC_BUMP_RATIO_THRESHOLD = 1.8
 
+        // Magnetic-field jitter "辅助确认" (assist-confirmation) signal.
+        // Mic RMS stays the sole primary decision signal; magnet jitter only
+        // speeds up or slows down the mic confirmation timer when it agrees
+        // or disagrees with the direction mic is already leaning. It never
+        // triggers a state change by itself.
+        //
+        // A single tick's jitter is too noisy to threshold directly (see
+        // magnetJitterSmoothed doc above), so this smooths over a short
+        // rolling window first.
+        const val MAGNET_SMOOTHING_WINDOW_MS = 4_000L
+        const val MAGNET_SMOOTHING_MIN_SAMPLES = 4
+
+        // Fixed fallback thresholds for the smoothed jitter, derived from
+        // the aggregate of 11 real rides (stopped medians ranged 0.39-1.6,
+        // moving medians ranged 1.9-3.7): comfortably inside both bands with
+        // margin on either side for phone-to-phone variation. Used until the
+        // dynamic per-state thresholds below have enough history.
+        const val MAGNET_STOP_JITTER_THRESHOLD = 1.2
+        const val MAGNET_MOVING_JITTER_THRESHOLD = 2.0
+
+        private const val MAGNET_DYNAMIC_HISTORY_MS = 180_000L
+        private const val MAGNET_MIN_SAMPLES_PER_STATE = 20
+        private const val MAGNET_MIN_STOP_THRESHOLD = 0.4
+        private const val MAGNET_MAX_STOP_THRESHOLD = 1.8
+        private const val MAGNET_MIN_MOVING_THRESHOLD = 1.5
+        private const val MAGNET_MAX_MOVING_THRESHOLD = 4.5
+        private const val MAGNET_MIN_HYSTERESIS_GAP = 0.3
+        private const val MAGNET_THRESHOLD_SMOOTHING = 0.08
+        private const val MAGNET_THRESHOLD_UPDATE_INTERVAL_MS = 5_000L
+
+        // How much the agreeing/disagreeing magnet candidate scales the
+        // mic-driven confirmation duration (STOP_CONFIRMATION_MS /
+        // MOVING_CONFIRMATION_MS above), with a floor so it can never make a
+        // transition near-instant.
+        const val MAGNET_ASSIST_AGREE_MULTIPLIER = 0.6
+        const val MAGNET_ASSIST_DISAGREE_MULTIPLIER = 1.4
+        const val MAGNET_ASSIST_MIN_CONFIRMATION_MS = 500L
+
         private const val DYNAMIC_HISTORY_MS = 180_000L
         private const val MIN_DYNAMIC_SAMPLES = 240
         private const val MIN_SAMPLES_PER_STATE = 20
@@ -114,6 +172,8 @@ class InferenceEngine {
 
     private data class MicPoint(val timestampMs: Long, val rms: Double, val trainState: String)
     private data class RecentMicSample(val timestampMs: Long, val rms: Double)
+    private data class MagnetPoint(val timestampMs: Long, val jitterSmoothed: Double, val trainState: String)
+    private data class RecentMagnetSample(val timestampMs: Long, val jitter: Double)
 
     private val micHistory = ArrayDeque<MicPoint>()
     // Short rolling window feeding the baseline-bump detector -- separate
@@ -121,6 +181,11 @@ class InferenceEngine {
     // is stable and is used for the (much longer, 3-minute) dynamic
     // threshold calculation instead.
     private val recentMicSamples = ArrayDeque<RecentMicSample>()
+    // Same split for the magnet channel: recentMagnetJitterSamples feeds the
+    // short smoothing window, magnetHistory feeds its own 3-minute dynamic
+    // per-state threshold.
+    private val recentMagnetJitterSamples = ArrayDeque<RecentMagnetSample>()
+    private val magnetHistory = ArrayDeque<MagnetPoint>()
     private var stableTrainState = STATE_CALIBRATING
     private var stopCandidateSince: Long? = null
     private var movingCandidateSince: Long? = null
@@ -130,10 +195,15 @@ class InferenceEngine {
     private var lastP25: Double? = null
     private var lastP70: Double? = null
     private var lastMagnetMagnitude: Double? = null
+    private var dynamicMagnetStopThreshold: Double? = null
+    private var dynamicMagnetMovingThreshold: Double? = null
+    private var lastMagnetThresholdUpdateAt = 0L
 
     fun reset() {
         micHistory.clear()
         recentMicSamples.clear()
+        recentMagnetJitterSamples.clear()
+        magnetHistory.clear()
         stableTrainState = STATE_CALIBRATING
         stopCandidateSince = null
         movingCandidateSince = null
@@ -143,6 +213,9 @@ class InferenceEngine {
         lastP25 = null
         lastP70 = null
         lastMagnetMagnitude = null
+        dynamicMagnetStopThreshold = null
+        dynamicMagnetMovingThreshold = null
+        lastMagnetThresholdUpdateAt = 0L
     }
 
     fun update(
@@ -160,6 +233,46 @@ class InferenceEngine {
             null
         }
         if (magnetMagnitude != null) lastMagnetMagnitude = magnetMagnitude
+
+        while (
+            recentMagnetJitterSamples.firstOrNull()?.timestampMs
+                ?.let { it < now - MAGNET_SMOOTHING_WINDOW_MS } == true
+        ) {
+            recentMagnetJitterSamples.removeFirst()
+        }
+        if (magnetMagnitudeJitter != null) {
+            recentMagnetJitterSamples.addLast(RecentMagnetSample(now, magnetMagnitudeJitter))
+        }
+        val magnetJitterSmoothed = if (recentMagnetJitterSamples.size >= MAGNET_SMOOTHING_MIN_SAMPLES) {
+            percentile(recentMagnetJitterSamples.map { it.jitter }.sorted(), 0.5)
+        } else {
+            null
+        }
+
+        // Label this smoothed sample with whichever train state was stable
+        // going into this tick (before any transition below) and fold it
+        // into the magnet channel's own 3-minute per-state history, same
+        // pattern as micHistory below.
+        if (
+            magnetJitterSmoothed != null &&
+            (stableTrainState == STATE_MOVING || stableTrainState == STATE_STOPPED)
+        ) {
+            val oldestAllowed = now - MAGNET_DYNAMIC_HISTORY_MS
+            while (magnetHistory.firstOrNull()?.timestampMs?.let { it < oldestAllowed } == true) {
+                magnetHistory.removeFirst()
+            }
+            magnetHistory.addLast(MagnetPoint(now, magnetJitterSmoothed, stableTrainState))
+            maybeUpdateDynamicMagnetThresholds(now)
+        }
+
+        val effectiveMagnetStopThreshold = dynamicMagnetStopThreshold ?: MAGNET_STOP_JITTER_THRESHOLD
+        val effectiveMagnetMovingThreshold = dynamicMagnetMovingThreshold ?: MAGNET_MOVING_JITTER_THRESHOLD
+        val magnetCandidateState = when {
+            magnetJitterSmoothed == null -> null
+            magnetJitterSmoothed <= effectiveMagnetStopThreshold -> STATE_STOPPED
+            magnetJitterSmoothed >= effectiveMagnetMovingThreshold -> STATE_MOVING
+            else -> null
+        }
 
         val micUsable = micValid && micRms >= MIC_NONZERO_FLOOR
         if (micUsable) {
@@ -235,6 +348,9 @@ class InferenceEngine {
                 micRmsBumpRatio = micRmsBumpRatio,
                 micRmsBumpCandidate = micRmsBumpCandidate,
                 magnetMagnitudeJitter = magnetMagnitudeJitter,
+                magnetJitterSmoothed = magnetJitterSmoothed,
+                magnetCandidateState = magnetCandidateState,
+                magnetAssistNote = "none",
                 reason = if (micValid) "mic-zero-hold-state" else "mic-invalid-hold-state",
             )
         }
@@ -247,6 +363,7 @@ class InferenceEngine {
         var reason: String
         var stopCandidateElapsedMs = 0L
         var movingCandidateElapsedMs = 0L
+        var magnetAssistNote = "none"
 
         when {
             micBelowStopThreshold -> {
@@ -257,7 +374,24 @@ class InferenceEngine {
                 } else {
                     val candidateSince = stopCandidateSince ?: now.also { stopCandidateSince = it }
                     stopCandidateElapsedMs = (now - candidateSince).coerceAtLeast(0L)
-                    if (stopCandidateElapsedMs >= STOP_CONFIRMATION_MS) {
+                    val requiredStopConfirmationMs: Long
+                    when (magnetCandidateState) {
+                        STATE_STOPPED -> {
+                            magnetAssistNote = "agree"
+                            requiredStopConfirmationMs = (STOP_CONFIRMATION_MS * MAGNET_ASSIST_AGREE_MULTIPLIER)
+                                .toLong()
+                                .coerceAtLeast(MAGNET_ASSIST_MIN_CONFIRMATION_MS)
+                        }
+                        STATE_MOVING -> {
+                            magnetAssistNote = "disagree"
+                            requiredStopConfirmationMs = (STOP_CONFIRMATION_MS * MAGNET_ASSIST_DISAGREE_MULTIPLIER)
+                                .toLong()
+                        }
+                        else -> {
+                            requiredStopConfirmationMs = STOP_CONFIRMATION_MS
+                        }
+                    }
+                    if (stopCandidateElapsedMs >= requiredStopConfirmationMs) {
                         stableTrainState = STATE_STOPPED
                         stopCandidateSince = null
                         reason = "mic-stop-confirmed"
@@ -275,7 +409,25 @@ class InferenceEngine {
                 } else {
                     val candidateSince = movingCandidateSince ?: now.also { movingCandidateSince = it }
                     movingCandidateElapsedMs = (now - candidateSince).coerceAtLeast(0L)
-                    if (movingCandidateElapsedMs >= MOVING_CONFIRMATION_MS) {
+                    val requiredMovingConfirmationMs: Long
+                    when (magnetCandidateState) {
+                        STATE_MOVING -> {
+                            magnetAssistNote = "agree"
+                            requiredMovingConfirmationMs =
+                                (MOVING_CONFIRMATION_MS * MAGNET_ASSIST_AGREE_MULTIPLIER)
+                                    .toLong()
+                                    .coerceAtLeast(MAGNET_ASSIST_MIN_CONFIRMATION_MS)
+                        }
+                        STATE_STOPPED -> {
+                            magnetAssistNote = "disagree"
+                            requiredMovingConfirmationMs =
+                                (MOVING_CONFIRMATION_MS * MAGNET_ASSIST_DISAGREE_MULTIPLIER).toLong()
+                        }
+                        else -> {
+                            requiredMovingConfirmationMs = MOVING_CONFIRMATION_MS
+                        }
+                    }
+                    if (movingCandidateElapsedMs >= requiredMovingConfirmationMs) {
                         stableTrainState = STATE_MOVING
                         movingCandidateSince = null
                         reason = "mic-moving-confirmed"
@@ -318,6 +470,9 @@ class InferenceEngine {
             micRmsBumpRatio = micRmsBumpRatio,
             micRmsBumpCandidate = micRmsBumpCandidate,
             magnetMagnitudeJitter = magnetMagnitudeJitter,
+            magnetJitterSmoothed = magnetJitterSmoothed,
+            magnetCandidateState = magnetCandidateState,
+            magnetAssistNote = magnetAssistNote,
             reason = reason,
         )
     }
@@ -341,6 +496,9 @@ class InferenceEngine {
         micRmsBumpRatio: Double,
         micRmsBumpCandidate: Boolean,
         magnetMagnitudeJitter: Double?,
+        magnetJitterSmoothed: Double?,
+        magnetCandidateState: String?,
+        magnetAssistNote: String,
         reason: String,
     ): InferenceResult {
         val state = combinedState(stableTrainState, playerActive)
@@ -378,6 +536,9 @@ class InferenceEngine {
             micRmsBumpRatio = micRmsBumpRatio,
             micRmsBumpCandidate = micRmsBumpCandidate,
             magnetMagnitudeJitter = magnetMagnitudeJitter,
+            magnetJitterSmoothed = magnetJitterSmoothed,
+            magnetCandidateState = magnetCandidateState,
+            magnetAssistNote = magnetAssistNote,
             reason = finalReason,
         )
     }
@@ -437,13 +598,56 @@ class InferenceEngine {
         lastThresholdUpdateAt = now
     }
 
+    private fun maybeUpdateDynamicMagnetThresholds(now: Long) {
+        if (lastMagnetThresholdUpdateAt != 0L &&
+            now - lastMagnetThresholdUpdateAt < MAGNET_THRESHOLD_UPDATE_INTERVAL_MS
+        ) {
+            return
+        }
+
+        // Same per-state-only percentile rationale as the mic thresholds
+        // above: deriving each threshold only from its own label's samples
+        // keeps it anchored regardless of how the "运行"/"停站" population is
+        // split in the recent window.
+        val stoppedJitter = magnetHistory
+            .mapNotNull { if (it.trainState == STATE_STOPPED) it.jitterSmoothed else null }
+            .sorted()
+        val movingJitter = magnetHistory
+            .mapNotNull { if (it.trainState == STATE_MOVING) it.jitterSmoothed else null }
+            .sorted()
+        if (stoppedJitter.size < MAGNET_MIN_SAMPLES_PER_STATE || movingJitter.size < MAGNET_MIN_SAMPLES_PER_STATE) {
+            return
+        }
+
+        val p75Stopped = percentile(stoppedJitter, 0.75)
+        val p25Moving = percentile(movingJitter, 0.25)
+        var targetStop = p75Stopped.coerceIn(MAGNET_MIN_STOP_THRESHOLD, MAGNET_MAX_STOP_THRESHOLD)
+        var targetMoving = p25Moving.coerceIn(MAGNET_MIN_MOVING_THRESHOLD, MAGNET_MAX_MOVING_THRESHOLD)
+
+        if (targetMoving - targetStop < MAGNET_MIN_HYSTERESIS_GAP) {
+            targetMoving = (targetStop + MAGNET_MIN_HYSTERESIS_GAP)
+                .coerceIn(MAGNET_MIN_MOVING_THRESHOLD, MAGNET_MAX_MOVING_THRESHOLD)
+            if (targetMoving - targetStop < MAGNET_MIN_HYSTERESIS_GAP) {
+                targetStop = (targetMoving - MAGNET_MIN_HYSTERESIS_GAP)
+                    .coerceIn(MAGNET_MIN_STOP_THRESHOLD, MAGNET_MAX_STOP_THRESHOLD)
+            }
+        }
+
+        dynamicMagnetStopThreshold = dynamicMagnetStopThreshold?.let { smooth(it, targetStop, MAGNET_THRESHOLD_SMOOTHING) }
+            ?: targetStop
+        dynamicMagnetMovingThreshold = dynamicMagnetMovingThreshold
+            ?.let { smooth(it, targetMoving, MAGNET_THRESHOLD_SMOOTHING) }
+            ?: targetMoving
+        lastMagnetThresholdUpdateAt = now
+    }
+
     private fun percentile(sorted: List<Double>, percentile: Double): Double {
         val index = ((sorted.size - 1) * percentile).toInt().coerceIn(sorted.indices)
         return sorted[index]
     }
 
-    private fun smooth(current: Double, target: Double): Double =
-        current + THRESHOLD_SMOOTHING * (target - current)
+    private fun smooth(current: Double, target: Double, factor: Double = THRESHOLD_SMOOTHING): Double =
+        current + factor * (target - current)
 
     private fun combinedState(trainState: String, playerActive: Boolean): String =
         if (trainState == STATE_STOPPED && playerActive) {
