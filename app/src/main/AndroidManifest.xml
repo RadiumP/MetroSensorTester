@@ -7,6 +7,11 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Needed for continuous GPS_PROVIDER fixes (InferenceEngine's optional
+         GPS calibration/authority signal, see GpsCollector) -- coarse alone
+         only unlocks NETWORK_PROVIDER, whose accuracy can't pass the
+         calibration test. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <!-- Local loopback socket only (see GameLinkServer.kt); Android still
          requires INTERNET for any socket, even 127.0.0.1-only traffic. -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -22,6 +27,9 @@
         android:required="false" />
     <uses-feature
         android:name="android.hardware.sensor.barometer"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.location.gps"
         android:required="false" />
 
     <application

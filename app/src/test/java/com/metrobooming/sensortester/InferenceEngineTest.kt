@@ -3,6 +3,7 @@ package com.metrobooming.sensortester
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -359,7 +360,7 @@ class InferenceEngineTest {
         now += 250L
         result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now) // first magnet sample, no jitter yet
 
-        repeat(21) {
+        repeat(22) {
             now += 250L
             magnet += 2.5
             result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
@@ -403,10 +404,14 @@ class InferenceEngineTest {
         // 12 ticks of a large jump (reads as "运行" once the smoothing
         // window fills), then 10 ticks of a tiny jump (the window fills
         // with enough of them to briefly flip the smoothed reading to
-        // "停站"), then back to large jumps. The resulting vote tally ends
-        // up 16 "运行" to 4 "停站" (80%) -- comfortably over the 75%
-        // majority bar, but not unanimous.
-        repeat(24) { index ->
+        // "停站" for a couple of ticks), then back to large jumps. The
+        // trigger itself fires on the 23rd tick (index 22) the instant the
+        // rolling-window vote tally clears the 75% majority bar -- one tick
+        // later the state has already flipped to "运行" and a fresh
+        // mic-driven stop candidate starts agreeing with the (still
+        // "停站"-reading) magnet, so this stops right at the trigger tick
+        // rather than one past it.
+        repeat(23) { index ->
             now += 250L
             magnet += if (index % 22 < 12) 3.0 else 0.1
             result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
@@ -414,5 +419,94 @@ class InferenceEngineTest {
 
         assertEquals("trigger", result.magnetAssistNote)
         assertEquals("运行", result.trainState)
+    }
+
+    @Test
+    fun gpsFallsBackToMicWhenCalibrationAccuracyIsPoor() {
+        // 2026-09-06 request: GPS is an opt-in per-ride signal, gated by a
+        // one-time accuracy test at the start of the ride (see
+        // GPS_CALIBRATION_WINDOW_MS's doc). Poor accuracy throughout the
+        // window (e.g. no real fix, or a degraded one) must permanently give
+        // up on GPS for the ride and leave mic/magnet driving train_state
+        // exactly as if GPS didn't exist.
+        val engine = InferenceEngine()
+        var now = 0L
+
+        // 5 samples of a 120m-accuracy fix spread across the 20s
+        // calibration window -- comfortably past GPS_CALIBRATION_MIN_SAMPLES
+        // but 0% of them clear the 20m accuracy gate.
+        var result = engine.update(0.0022, true, 0.0, 0.1, 1.0, null, now, null, 120.0)
+        repeat(4) {
+            now += 5_000L
+            result = engine.update(0.0022, true, 0.0, 0.1, 1.0, null, now, null, 120.0)
+        }
+        assertEquals(20_000L, now)
+        assertEquals(InferenceEngine.GPS_STATUS_UNUSABLE, result.gpsCalibrationStatus)
+
+        // From here on mic alone drives train_state, with its normal timing.
+        now += 250L
+        engine.update(0.0010, true, 0.0, 0.1, 1.0, null, now)
+        now += InferenceEngine.STOP_CONFIRMATION_MS
+        result = engine.update(0.0010, true, 0.0, 0.1, 1.0, null, now)
+        assertEquals("停站", result.trainState)
+        assertTrue(result.reason.startsWith("mic-"))
+    }
+
+    @Test
+    fun gpsBecomesAuthoritativeAndOverridesDisagreeingMic() {
+        // Mirror of the test above with an accurate fix throughout the
+        // calibration window: GPS speed should become the sole authority
+        // for train_state, with its own (shorter) confirmation timing,
+        // overriding whatever a strongly-disagreeing mic reading would have
+        // decided on its own.
+        val engine = InferenceEngine()
+        var now = 0L
+        val goodAccuracy = 5.0
+        // Strictly between the mic stop/moving thresholds during
+        // calibration, so mic itself never settles on a state -- keeps
+        // stableTrainState at "校准中" until GPS takes over, isolating the
+        // GPS state machine's own confirmation timing from mic's (a mic
+        // reading confidently inside either band would otherwise confirm
+        // its own state well before the 20s calibration window elapses,
+        // since STOP_CONFIRMATION_MS/MOVING_CONFIRMATION_MS are both under
+        // 20s).
+        val ambiguousMicRms = 0.0016
+        // Once GPS is authoritative, hold mic deep in "stopped" territory
+        // for the rest of the test -- if GPS ever stopped being
+        // authoritative this would pull train_state back to "停站", so a
+        // final "运行" result can only mean GPS won.
+        val quietMicRms = 0.0005
+
+        var result = engine.update(ambiguousMicRms, true, 0.0, 0.1, 1.0, null, now, 0.0, goodAccuracy)
+        repeat(4) {
+            now += 5_000L
+            result = engine.update(ambiguousMicRms, true, 0.0, 0.1, 1.0, null, now, 0.0, goodAccuracy)
+        }
+        assertEquals(20_000L, now)
+        assertEquals(InferenceEngine.GPS_STATUS_USABLE, result.gpsCalibrationStatus)
+        assertEquals("校准中", result.trainState)
+        assertEquals("gps-stop-confirming", result.reason)
+
+        // GPS just became authoritative on that last tick and immediately
+        // started a "停站" candidate (speed 0.0 the whole window). 8 more
+        // ticks (2000ms) confirm it.
+        repeat(8) {
+            now += 250L
+            result = engine.update(quietMicRms, true, 0.0, 0.1, 1.0, null, now, 0.0, goodAccuracy)
+        }
+        assertEquals(22_000L, now)
+        assertEquals("停站", result.trainState)
+        assertEquals("gps-stop-confirmed", result.reason)
+
+        // GPS speed now says moving; mic RMS is unchanged (still deep in
+        // "stopped" territory) -- GPS should win once its own 1500ms
+        // confirmation elapses.
+        repeat(7) {
+            now += 250L
+            result = engine.update(quietMicRms, true, 0.0, 0.1, 1.0, null, now, 3.0, goodAccuracy)
+        }
+        assertEquals(23_750L, now)
+        assertEquals("运行", result.trainState)
+        assertEquals("gps-moving-confirmed", result.reason)
     }
 }

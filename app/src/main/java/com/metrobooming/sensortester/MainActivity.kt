@@ -235,6 +235,12 @@ class MainActivity : Activity() {
             appendLine("WakeLock    : ${if (status.wakeLockHeld) "已持有" else "未持有"}")
             appendLine("Activity    : ${if (status.appInForeground) "前台" else "后台"}")
             appendLine("屏幕        : ${if (status.screenOn) "开启" else "关闭"}")
+            appendLine(
+                "GPS状态      : ${inferred?.gpsCalibrationStatus ?: "未知"} · " +
+                    "候选 ${inferred?.gpsCandidateState ?: "-"} · " +
+                    "速度 ${format(inferred?.gpsSpeedMps, 2)} m/s · " +
+                    "精度 ${format(inferred?.gpsAccuracyM, 1)} m"
+            )
             appendLine("加速度 RMS : ${format(sensor?.accelRms, 4)} m/s²")
             appendLine(
                 "陀螺仪 RMS : ${format(sensor?.gyroRms?.times(180.0 / kotlin.math.PI), 2)} °/s"
@@ -257,6 +263,12 @@ class MainActivity : Activity() {
         }
         if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             missing += Manifest.permission.ACCESS_COARSE_LOCATION
+        }
+        // Fine location is optional -- GPS_calibration test in InferenceEngine
+        // simply never passes without it, and the app falls back to
+        // mic/magnet as if GPS didn't exist (see requestStart's Toast below).
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            missing += Manifest.permission.ACCESS_FINE_LOCATION
         }
 
         if (missing.isEmpty()) {
@@ -295,6 +307,16 @@ class MainActivity : Activity() {
             PackageManager.PERMISSION_GRANTED
         ) {
             Toast.makeText(this, "未授予位置权限：罗盘仍使用磁北，真北暂不可用", Toast.LENGTH_LONG).show()
+        }
+        if (
+            checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            Toast.makeText(
+                this,
+                "未授予精确位置权限：GPS 校准测试不会通过，本次仍使用麦克风/磁场判定",
+                Toast.LENGTH_LONG,
+            ).show()
         }
     }
 

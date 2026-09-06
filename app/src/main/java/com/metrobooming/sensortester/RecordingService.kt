@@ -75,6 +75,9 @@ class RecordingService : Service() {
             "audio_read_count", "audio_samples_read", "audio_zero_sample_ratio",
             "audio_last_read_result", "audio_read_error", "active_recording_config_count",
             "audio_route_change_count", "audio_restart_reason",
+            "gps_speed_mps", "gps_accuracy_m", "gps_fix_age_ms",
+            "gps_calibration_status", "gps_candidate_state",
+            "gps_stop_candidate_elapsed_ms", "gps_moving_candidate_elapsed_ms",
             "mark", "segment_id", "device_model", "android_version",
         )
     }
@@ -92,6 +95,7 @@ class RecordingService : Service() {
     private val rowLock = Any()
 
     private lateinit var sensors: SensorCollector
+    private lateinit var gps: GpsCollector
     private lateinit var powerManager: PowerManager
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -122,6 +126,7 @@ class RecordingService : Service() {
     override fun onCreate() {
         super.onCreate()
         sensors = SensorCollector(this)
+        gps = GpsCollector(this)
         powerManager = getSystemService(POWER_SERVICE) as PowerManager
         createNotificationChannel()
         audio = AudioCollector(this)
@@ -176,6 +181,7 @@ class RecordingService : Service() {
             handler.removeCallbacks(tick)
             sensors.stop()
             audio.stop()
+            gps.stop()
             releaseWakeLock()
         }
         foregroundServiceActive = false
@@ -194,6 +200,7 @@ class RecordingService : Service() {
             handler.removeCallbacks(tick)
             sensors.stop()
             audio.stop()
+            gps.stop()
         }
         releaseWakeLock()
         gameLink.stop()
@@ -216,6 +223,7 @@ class RecordingService : Service() {
         acquireWakeLock()
         sensors.start()
         audio.start()
+        gps.start()
         recording = true
         latestStatus = RecordingStatus(
             recording = true,
@@ -239,6 +247,7 @@ class RecordingService : Service() {
             val wallClockNow = System.currentTimeMillis()
             val sensor = sensors.takeSnapshot()
             val mic = audio.takeSnapshot(now)
+            val gpsSnapshot = gps.takeSnapshot(now)
             if (lastAudioSource != null && lastAudioSource != mic.audioSource) {
                 // The RMS scale this reading is on may have just changed
                 // (see lastAudioSource doc above) -- any history/dynamic
@@ -257,6 +266,8 @@ class RecordingService : Service() {
                 gyroRmsDeg,
                 sensor.magnetMagnitude,
                 now,
+                gpsSnapshot.speedMps,
+                gpsSnapshot.accuracyM,
             )
             val screenOn = powerManager.isInteractive
             val wakeLockHeld = wakeLock?.isHeld == true
@@ -334,6 +345,13 @@ class RecordingService : Service() {
                 mic.activeRecordingConfigCount,
                 mic.routeChangeCount,
                 mic.restartReason,
+                inferred.gpsSpeedMps,
+                inferred.gpsAccuracyM,
+                gpsSnapshot.fixAgeMs,
+                inferred.gpsCalibrationStatus,
+                inferred.gpsCandidateState ?: "",
+                inferred.gpsStopCandidateElapsedMs,
+                inferred.gpsMovingCandidateElapsedMs,
                 currentMark, segmentId,
                 Build.MODEL, Build.VERSION.RELEASE,
             )

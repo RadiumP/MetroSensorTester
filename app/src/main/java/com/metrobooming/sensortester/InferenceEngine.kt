@@ -79,6 +79,22 @@ data class InferenceResult(
     // itself, because mic never even attempted a candidate for it. Mic
     // RMS otherwise stays the primary decision signal.
     val magnetAssistNote: String,
+    // Echoes of this tick's GPS input, for CSV inspection/comparison. Null
+    // whenever no fix was available this tick (no permission, no provider,
+    // underground, or the last fix went stale -- see GpsCollector).
+    val gpsSpeedMps: Double?,
+    val gpsAccuracyM: Double?,
+    // "校准中" (still inside the one-time accuracy-test window) / "可用"
+    // (test passed -- GPS is now authoritative for the rest of the ride) /
+    // "不可用" (test failed -- permanently ignoring GPS for this ride). See
+    // GPS_CALIBRATION_WINDOW_MS's doc for the test itself.
+    val gpsCalibrationStatus: String,
+    // "运行"/"停站"/null candidate reading from GPS speed alone, using the
+    // same fixed-speed-band idea as the mic/magnet channels. Only ever
+    // non-null while gpsCalibrationStatus == "可用".
+    val gpsCandidateState: String?,
+    val gpsStopCandidateElapsedMs: Long,
+    val gpsMovingCandidateElapsedMs: Long,
     val reason: String,
 )
 
@@ -194,6 +210,53 @@ class InferenceEngine {
         private const val MIN_MOVING_THRESHOLD = 0.0010
         private const val MAX_MOVING_THRESHOLD = 0.0030
 
+        // GPS as an optional primary signal ("位准", 2026-09-06 request):
+        // unlike the magnet channel above, this is not an assist -- once a
+        // fix proves accurate enough during a one-time test at the start of
+        // the ride, GPS-derived ground speed becomes the SOLE authority for
+        // train_state for the rest of that ride, and the mic/magnet fusion
+        // above is bypassed entirely (mic/magnet keep being computed and
+        // logged for comparison, and mic history keeps accumulating in the
+        // background, but neither can move stableTrainState anymore).
+        //
+        // This is deliberately opt-in per ride rather than a hard
+        // requirement: if the window ends without enough accurate fixes --
+        // the expected case underground, where GPS often gets no fix at all
+        // -- GPS is given up on for the rest of that ride and the mic/magnet
+        // logic stays authoritative, exactly as if GPS didn't exist. The
+        // decision is made once and never re-tried mid-ride, so a route that
+        // starts underground (test fails) and later surfaces will not
+        // retroactively pick GPS back up -- acceptable for now since the
+        // routes this matters for (a quiet at-grade light rail) have GPS
+        // available from the very start.
+        //
+        // ACCESS_COARSE_LOCATION alone (already used for the one-shot
+        // magnetic-declination fix in SensorCollector) only unlocks
+        // NETWORK_PROVIDER, whose accuracy is routinely worse than
+        // GPS_ACCURACY_THRESHOLD_M -- ACCESS_FINE_LOCATION is required for
+        // this to ever pass the test. See GpsCollector for the actual fix
+        // subscription.
+        const val GPS_CALIBRATION_WINDOW_MS = 20_000L
+        const val GPS_CALIBRATION_MIN_SAMPLES = 5
+        const val GPS_ACCURACY_THRESHOLD_M = 20.0
+        const val GPS_CALIBRATION_MIN_GOOD_RATIO = 0.6
+
+        // First-cut speed thresholds/confirmation windows -- not yet
+        // validated against real GPS logs the way the mic/magnet numbers
+        // above were (no field data with GPS enabled exists yet). GPS speed
+        // is a fairly direct measurement of ground speed (unlike the mic RMS
+        // proxy above), so a shorter confirmation window than the mic's
+        // should still be safe against noise; expect to revisit both once
+        // real ride logs come in.
+        const val GPS_MOVING_SPEED_MPS = 1.4
+        const val GPS_STOP_SPEED_MPS = 0.5
+        const val GPS_STOP_CONFIRMATION_MS = 2_000L
+        const val GPS_MOVING_CONFIRMATION_MS = 1_500L
+
+        const val GPS_STATUS_CALIBRATING = "校准中"
+        const val GPS_STATUS_USABLE = "可用"
+        const val GPS_STATUS_UNUSABLE = "不可用"
+
         private const val STATE_CALIBRATING = "校准中"
         private const val STATE_MOVING = "运行"
         private const val STATE_STOPPED = "停站"
@@ -207,6 +270,17 @@ class InferenceEngine {
     private data class MagnetPoint(val timestampMs: Long, val jitterSmoothed: Double, val trainState: String)
     private data class RecentMagnetSample(val timestampMs: Long, val jitter: Double)
     private data class MagnetCandidateVote(val timestampMs: Long, val state: String)
+    private data class GpsOutcome(
+        val calibrationStatus: String,
+        val usable: Boolean,
+        val candidateState: String?,
+        val stopCandidateElapsedMs: Long,
+        val movingCandidateElapsedMs: Long,
+        // Non-null only when GPS is authoritative this tick (calibration
+        // passed); this becomes the tick's overall decision reason and
+        // bypasses the mic/magnet block entirely.
+        val reason: String?,
+    )
 
     private val micHistory = ArrayDeque<MicPoint>()
     // Short rolling window feeding the baseline-bump detector -- separate
@@ -232,6 +306,14 @@ class InferenceEngine {
     private var dynamicMagnetMovingThreshold: Double? = null
     private var lastMagnetThresholdUpdateAt = 0L
     private val magnetCandidateVotes = ArrayDeque<MagnetCandidateVote>()
+    private var gpsFirstUpdateAt: Long? = null
+    private val gpsCalibrationAccuracySamples = mutableListOf<Double>()
+    // null = calibration window still open (or not yet started); true/false
+    // = decided, locked for the rest of the ride (see GPS_CALIBRATION_WINDOW_MS
+    // doc above).
+    private var gpsUsable: Boolean? = null
+    private var gpsStopCandidateSince: Long? = null
+    private var gpsMovingCandidateSince: Long? = null
 
     fun reset() {
         micHistory.clear()
@@ -251,6 +333,11 @@ class InferenceEngine {
         dynamicMagnetMovingThreshold = null
         lastMagnetThresholdUpdateAt = 0L
         magnetCandidateVotes.clear()
+        gpsFirstUpdateAt = null
+        gpsCalibrationAccuracySamples.clear()
+        gpsUsable = null
+        gpsStopCandidateSince = null
+        gpsMovingCandidateSince = null
     }
 
     fun update(
@@ -261,6 +348,8 @@ class InferenceEngine {
         gyroDegreesRms: Double,
         magnetMagnitude: Double?,
         now: Long,
+        gpsSpeedMps: Double? = null,
+        gpsAccuracyM: Double? = null,
     ): InferenceResult {
         val magnetMagnitudeJitter = if (magnetMagnitude != null && lastMagnetMagnitude != null) {
             kotlin.math.abs(magnetMagnitude - lastMagnetMagnitude!!)
@@ -361,6 +450,54 @@ class InferenceEngine {
             0.0
         }
 
+        val gpsOutcome = updateGpsState(gpsSpeedMps, gpsAccuracyM, now)
+        if (gpsOutcome.usable) {
+            // GPS is authoritative for the rest of this ride: bypass the
+            // mic/magnet-driven state machine entirely for stableTrainState
+            // (updateGpsState already applied this tick's GPS decision to
+            // it), but keep mic history accumulating in the background and
+            // keep all mic/magnet diagnostic fields populated for CSV
+            // comparison against the GPS-driven decision.
+            stopCandidateSince = null
+            movingCandidateSince = null
+            if (
+                micUsable && micRms >= MIC_NONZERO_FLOOR &&
+                (stableTrainState == STATE_MOVING || stableTrainState == STATE_STOPPED)
+            ) {
+                micHistory.addLast(MicPoint(now, micRms, stableTrainState))
+            }
+            return result(
+                micRms = micRms,
+                playerActive = playerActive,
+                playerState = playerState,
+                rawTrainState = stableTrainState,
+                effectiveStopThreshold = effectiveStopThreshold,
+                effectiveMovingThreshold = effectiveMovingThreshold,
+                thresholdMode = thresholdMode,
+                micLevelRatio = micLevelRatio,
+                micAboveMovingThreshold = micAboveMovingThreshold,
+                micBelowStopThreshold = micBelowStopThreshold,
+                stopCandidateElapsedMs = 0L,
+                movingCandidateElapsedMs = 0L,
+                micCrestFactor = micCrestFactor,
+                micChimeCandidate = micChimeCandidate,
+                micBaselineRms = micBaselineRms,
+                micRmsBumpRatio = micRmsBumpRatio,
+                micRmsBumpCandidate = micRmsBumpCandidate,
+                magnetMagnitudeJitter = magnetMagnitudeJitter,
+                magnetJitterSmoothed = magnetJitterSmoothed,
+                magnetCandidateState = magnetCandidateState,
+                magnetAssistNote = "none",
+                gpsSpeedMps = gpsSpeedMps,
+                gpsAccuracyM = gpsAccuracyM,
+                gpsCalibrationStatus = gpsOutcome.calibrationStatus,
+                gpsCandidateState = gpsOutcome.candidateState,
+                gpsStopCandidateElapsedMs = gpsOutcome.stopCandidateElapsedMs,
+                gpsMovingCandidateElapsedMs = gpsOutcome.movingCandidateElapsedMs,
+                reason = gpsOutcome.reason ?: "gps-hold-state",
+            )
+        }
+
         if (!micUsable) {
             stopCandidateSince = null
             movingCandidateSince = null
@@ -386,6 +523,12 @@ class InferenceEngine {
                 magnetJitterSmoothed = magnetJitterSmoothed,
                 magnetCandidateState = magnetCandidateState,
                 magnetAssistNote = "none",
+                gpsSpeedMps = gpsSpeedMps,
+                gpsAccuracyM = gpsAccuracyM,
+                gpsCalibrationStatus = gpsOutcome.calibrationStatus,
+                gpsCandidateState = gpsOutcome.candidateState,
+                gpsStopCandidateElapsedMs = 0L,
+                gpsMovingCandidateElapsedMs = 0L,
                 reason = if (micValid) "mic-zero-hold-state" else "mic-invalid-hold-state",
             )
         }
@@ -541,6 +684,12 @@ class InferenceEngine {
             magnetJitterSmoothed = magnetJitterSmoothed,
             magnetCandidateState = magnetCandidateState,
             magnetAssistNote = magnetAssistNote,
+            gpsSpeedMps = gpsSpeedMps,
+            gpsAccuracyM = gpsAccuracyM,
+            gpsCalibrationStatus = gpsOutcome.calibrationStatus,
+            gpsCandidateState = gpsOutcome.candidateState,
+            gpsStopCandidateElapsedMs = 0L,
+            gpsMovingCandidateElapsedMs = 0L,
             reason = reason,
         )
     }
@@ -567,6 +716,12 @@ class InferenceEngine {
         magnetJitterSmoothed: Double?,
         magnetCandidateState: String?,
         magnetAssistNote: String,
+        gpsSpeedMps: Double?,
+        gpsAccuracyM: Double?,
+        gpsCalibrationStatus: String,
+        gpsCandidateState: String?,
+        gpsStopCandidateElapsedMs: Long,
+        gpsMovingCandidateElapsedMs: Long,
         reason: String,
     ): InferenceResult {
         val state = combinedState(stableTrainState, playerActive)
@@ -607,6 +762,12 @@ class InferenceEngine {
             magnetJitterSmoothed = magnetJitterSmoothed,
             magnetCandidateState = magnetCandidateState,
             magnetAssistNote = magnetAssistNote,
+            gpsSpeedMps = gpsSpeedMps,
+            gpsAccuracyM = gpsAccuracyM,
+            gpsCalibrationStatus = gpsCalibrationStatus,
+            gpsCandidateState = gpsCandidateState,
+            gpsStopCandidateElapsedMs = gpsStopCandidateElapsedMs,
+            gpsMovingCandidateElapsedMs = gpsMovingCandidateElapsedMs,
             reason = finalReason,
         )
     }
@@ -707,6 +868,97 @@ class InferenceEngine {
             ?.let { smooth(it, targetMoving, MAGNET_THRESHOLD_SMOOTHING) }
             ?: targetMoving
         lastMagnetThresholdUpdateAt = now
+    }
+
+    // Runs the one-time GPS accuracy calibration test and, once passed, the
+    // GPS-speed candidate/confirmation state machine that becomes
+    // authoritative over stableTrainState. See GPS_CALIBRATION_WINDOW_MS's
+    // doc in the companion object for the overall design.
+    private fun updateGpsState(speedMps: Double?, accuracyM: Double?, now: Long): GpsOutcome {
+        if (gpsFirstUpdateAt == null) gpsFirstUpdateAt = now
+        val elapsedSinceFirstUpdate = now - gpsFirstUpdateAt!!
+
+        if (gpsUsable == null) {
+            if (accuracyM != null) gpsCalibrationAccuracySamples.add(accuracyM)
+            if (elapsedSinceFirstUpdate >= GPS_CALIBRATION_WINDOW_MS) {
+                val total = gpsCalibrationAccuracySamples.size
+                val good = gpsCalibrationAccuracySamples.count { it <= GPS_ACCURACY_THRESHOLD_M }
+                gpsUsable = total >= GPS_CALIBRATION_MIN_SAMPLES &&
+                    good.toDouble() / total >= GPS_CALIBRATION_MIN_GOOD_RATIO
+            } else {
+                return GpsOutcome(GPS_STATUS_CALIBRATING, false, null, 0L, 0L, null)
+            }
+        }
+
+        if (gpsUsable != true) {
+            return GpsOutcome(GPS_STATUS_UNUSABLE, false, null, 0L, 0L, null)
+        }
+
+        if (speedMps == null) {
+            // Fix temporarily lost (e.g. a brief tunnel) -- hold whatever
+            // state GPS last confirmed rather than falling back to mic. If
+            // field data shows routes that lose the fix for long stretches
+            // mid-ride, this is the place to revisit a mic fallback; not
+            // attempted yet since the request this implements was scoped to
+            // the start-of-ride calibration decision.
+            gpsStopCandidateSince = null
+            gpsMovingCandidateSince = null
+            return GpsOutcome(GPS_STATUS_USABLE, true, null, 0L, 0L, "gps-fix-lost-hold-state")
+        }
+
+        val candidateState = when {
+            speedMps <= GPS_STOP_SPEED_MPS -> STATE_STOPPED
+            speedMps >= GPS_MOVING_SPEED_MPS -> STATE_MOVING
+            else -> null
+        }
+
+        var stopElapsed = 0L
+        var movingElapsed = 0L
+        val reason: String
+
+        when (candidateState) {
+            STATE_STOPPED -> {
+                gpsMovingCandidateSince = null
+                if (stableTrainState == STATE_STOPPED) {
+                    gpsStopCandidateSince = null
+                    reason = "gps-stop-hold"
+                } else {
+                    val since = gpsStopCandidateSince ?: now.also { gpsStopCandidateSince = it }
+                    stopElapsed = (now - since).coerceAtLeast(0L)
+                    if (stopElapsed >= GPS_STOP_CONFIRMATION_MS) {
+                        stableTrainState = STATE_STOPPED
+                        gpsStopCandidateSince = null
+                        reason = "gps-stop-confirmed"
+                    } else {
+                        reason = "gps-stop-confirming"
+                    }
+                }
+            }
+            STATE_MOVING -> {
+                gpsStopCandidateSince = null
+                if (stableTrainState == STATE_MOVING) {
+                    gpsMovingCandidateSince = null
+                    reason = "gps-moving-hold"
+                } else {
+                    val since = gpsMovingCandidateSince ?: now.also { gpsMovingCandidateSince = it }
+                    movingElapsed = (now - since).coerceAtLeast(0L)
+                    if (movingElapsed >= GPS_MOVING_CONFIRMATION_MS) {
+                        stableTrainState = STATE_MOVING
+                        gpsMovingCandidateSince = null
+                        reason = "gps-moving-confirmed"
+                    } else {
+                        reason = "gps-moving-confirming"
+                    }
+                }
+            }
+            else -> {
+                gpsStopCandidateSince = null
+                gpsMovingCandidateSince = null
+                reason = "gps-ambiguous-hold-state"
+            }
+        }
+
+        return GpsOutcome(GPS_STATUS_USABLE, true, candidateState, stopElapsed, movingElapsed, reason)
     }
 
     private fun percentile(sorted: List<Double>, percentile: Double): Double {
