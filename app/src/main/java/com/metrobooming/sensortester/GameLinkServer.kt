@@ -13,19 +13,19 @@ import kotlin.concurrent.thread
  * A minimal local-loopback data feed for a companion game running on the
  * same device (see the "手机游戏联动" section in README.md).
  *
- * Broadcasts one JSON line per recording tick -- train state, player
+ * Broadcasts one JSON line per recording tick — train state, player
  * activity, and the raw intensity signals a game might want for difficulty
- * -- to every connected client. Deliberately dumb on purpose: no
+ * — to every connected client. Deliberately dumb on purpose: no
  * handshake, no WebSocket framing, no auth (loopback-only, nothing else on
  * the device can reach it without root). Any client that can open a TCP
- * socket and read lines -- Godot's StreamPeerTCP included -- can consume
+ * socket and read lines — Godot's StreamPeerTCP included — can consume
  * this directly without an Android-specific plugin.
  *
  * Best-effort and fire-and-forget: a slow, absent, or crashed client never
  * blocks or slows down sensor collection. broadcastState() is called from
  * RecordingService's main-thread tick loop, so it only builds the JSON
  * payload inline and hands the actual socket write off to a background
- * executor -- Android throws NetworkOnMainThreadException on any socket I/O
+ * executor — Android throws NetworkOnMainThreadException on any socket I/O
  * (including a write on an already-open connection) attempted from the main
  * thread.
  */
@@ -43,7 +43,7 @@ class GameLinkServer {
 
     // broadcastState() is called from RecordingService's main-thread tick loop.
     // Android throws NetworkOnMainThreadException on ANY socket I/O from the
-    // main thread, including a write to an already-open connection -- so the
+    // main thread, including a write to an already-open connection — so the
     // actual write has to happen on this background thread, not inline.
     private val ioExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "metro-game-link-io").apply { isDaemon = true }
@@ -57,12 +57,12 @@ class GameLinkServer {
                 // Bind explicitly to the IPv4 loopback literal. getLoopbackAddress()
                 // can resolve to the IPv6 loopback (::1) on some devices, which a
                 // client dialing the literal "127.0.0.1" (like Godot's
-                // StreamPeerTCP.connect_to_host) can never reach -- the OS returns
+                // StreamPeerTCP.connect_to_host) can never reach — the OS returns
                 // an instant connection-refused RST for that exact address:port,
                 // even though a server actually is listening one address family over.
                 ServerSocket(PORT, 4, InetAddress.getByName("127.0.0.1"))
             } catch (e: Exception) {
-                // Port already taken by another instance, or sockets unavailable --
+                // Port already taken by another instance, or sockets unavailable —
                 // the game link is a nice-to-have, never fail recording over it.
                 Log.w(TAG, "failed to bind 127.0.0.1:$PORT", e)
                 return
@@ -105,7 +105,7 @@ class GameLinkServer {
         accelRms: Double,
         gyroRmsDegS: Double,
     ) {
-        // Safe to check on the caller's (main) thread -- only guards an early
+        // Safe to check on the caller's (main) thread — only guards an early
         // return, no I/O happens here.
         val hasClients = synchronized(lock) { writers.isNotEmpty() }
         if (!hasClients) return
@@ -121,7 +121,7 @@ class GameLinkServer {
             put("gyro_rms_deg_s", gyroRmsDegS)
         }
         val line = (json.toString() + "\n").toByteArray(Charsets.UTF_8)
-        // The actual socket write is the network I/O part -- runs on ioExecutor,
+        // The actual socket write is the network I/O part — runs on ioExecutor,
         // never on the caller's thread.
         try {
             ioExecutor.execute { writeToAllClients(line) }

@@ -3,7 +3,7 @@ extends Control
 # Minimal verification client for GameLinkServer.
 #
 # Connects to MetroSensorTester's local loopback socket and shows whatever
-# it receives. This is NOT the real game -- it's just proof that the pipe
+# it receives. This is NOT the real game — it's just proof that the pipe
 # (RecordingService -> GameLinkServer -> TCP -> Godot) actually works before
 # building anything on top of it.
 #
@@ -14,7 +14,7 @@ extends Control
 # 2. Faster dev loop, from a PC: connect the phone over USB with MetroSensorTester
 #    running and recording started, then run
 #        adb forward tcp:8765 tcp:8765
-#    and just hit Play in the Godot editor -- 127.0.0.1:8765 on the PC gets
+#    and just hit Play in the Godot editor — 127.0.0.1:8765 on the PC gets
 #    forwarded to the phone's loopback socket.
 
 const HOST := "127.0.0.1"

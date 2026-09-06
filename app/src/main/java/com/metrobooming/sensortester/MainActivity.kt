@@ -264,7 +264,7 @@ class MainActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
             missing += Manifest.permission.ACCESS_COARSE_LOCATION
         }
-        // Fine location is optional -- GPS_calibration test in InferenceEngine
+        // Fine location is optional — GPS_calibration test in InferenceEngine
         // simply never passes without it, and the app falls back to
         // mic/magnet as if GPS didn't exist (see requestStart's Toast below).
         if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
@@ -349,7 +349,7 @@ class MainActivity : Activity() {
     // gets its own number (rather than reusing the same "广播" string) so
     // repeated presses each land as a distinct, separately-timestamped mark
     // in the CSV instead of being swallowed by RecordingService.setMark()'s
-    // "only bump segment_id when the mark actually changes" check -- these
+    // "only bump segment_id when the mark actually changes" check — these
     // are meant as ground-truth timestamps to check mic_chime_candidate
     // against, not a persistent state label.
     private fun markBroadcastHeard() {

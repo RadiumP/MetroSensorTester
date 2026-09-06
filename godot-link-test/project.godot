@@ -1,5 +1,5 @@
 ; Engine configuration file.
-; Rice Rider -- 基础主循环 v0 原型（见仓库根目录 RICE_RIDER_DESIGN.md）。
+; Rice Rider — 基础主循环 v0 原型（见仓库根目录 RICE_RIDER_DESIGN.md）。
 ; 这个文件夹原本是 GameLinkServer 的最小验证客户端（Main.tscn/Main.gd 还留着，
 ; 纯排查连接问题时可以把 run/main_scene 临时切回它）；现在 Game.tscn 是真正
 ; 在跑的第一版可玩原型，用来实地测试"数据映射到游戏节奏"这套设计是否成立。
@@ -26,7 +26,7 @@ window/handheld/orientation=1
 ; Android synthesizes an InputEventMouseButton for every real touch by
 ; default. Game.gd's _unhandled_input() handles both InputEventScreenTouch
 ; and InputEventMouseButton (so mouse clicks still work when testing in the
-; desktop editor) -- without this, every on-device tap fired BOTH events and
+; desktop editor) — without this, every on-device tap fired BOTH events and
 ; moved the lane twice, which always overshoots the middle lane and bounces
 ; between the two outer ones.
 pointing/emulate_mouse_from_touch=false

@@ -116,8 +116,8 @@ class RecordingService : Service() {
     // Tracks AudioCollector's reported audio_source so a mid-session fallback
     // (e.g. AudioRecoveryPolicy giving up on UNPROCESSED and switching to MIC
     // after repeated zero-PCM failures) is noticed. Different sources can
-    // read on very different RMS scales on the same device -- real-ride
-    // field test (2026-09-02) saw ~100x -- so the mic RMS history and
+    // read on very different RMS scales on the same device — real-ride
+    // field test (2026-09-02) saw ~100x — so the mic RMS history and
     // thresholds learned under the old source are no longer meaningful once
     // it changes; resetting lets the engine recalibrate from scratch instead
     // of silently misjudging train_state against a stale scale.
@@ -250,7 +250,7 @@ class RecordingService : Service() {
             val gpsSnapshot = gps.takeSnapshot(now)
             if (lastAudioSource != null && lastAudioSource != mic.audioSource) {
                 // The RMS scale this reading is on may have just changed
-                // (see lastAudioSource doc above) -- any history/dynamic
+                // (see lastAudioSource doc above) — any history/dynamic
                 // thresholds learned so far are no longer trustworthy.
                 inference.reset()
             }

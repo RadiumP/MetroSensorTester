@@ -173,7 +173,7 @@ class InferenceEngineTest {
         now += InferenceEngine.STOP_CONFIRMATION_MS
         engine.update(0.0009, true, 0.0, 0.1, 1.0, null, now)
 
-        // 700 "停站" samples: mostly quiet, ~10% loud platform noise -- but
+        // 700 "停站" samples: mostly quiet, ~10% loud platform noise — but
         // always below the fixed moving threshold (0.0018) so the state never
         // flips while this history is being built.
         repeat(700) { index ->
@@ -198,7 +198,7 @@ class InferenceEngineTest {
         // The 700 quiet/loud-but-stopped samples outnumber the 25 moving
         // samples roughly 28:1. A combined-history percentile would have
         // computed the moving split point from the stopped population and
-        // clamped it down to MIN_MOVING_THRESHOLD (0.0016) -- below the fixed
+        // clamped it down to MIN_MOVING_THRESHOLD (0.0016) — below the fixed
         // default. The per-state P25-of-moving-only calculation must instead
         // stay at or above the genuine moving noise level.
         assertTrue(dynamic.effectiveMovingThreshold >= InferenceEngine.MIC_MOVING_RMS_THRESHOLD)
@@ -215,13 +215,13 @@ class InferenceEngineTest {
         assertFalse(ordinaryLoud.micChimeCandidate)
 
         // A brief, sharp tone (the fixed station announcement chime) barely
-        // moves the windowed RMS average but spikes the peak -- crest factor
+        // moves the windowed RMS average but spikes the peak — crest factor
         // far above ordinary cabin noise.
         val chime = engine.update(0.0012, true, 0.0012 * 12.0, 0.1, 1.0, null, 250L)
         assertTrue(chime.micChimeCandidate)
         assertEquals(12.0, chime.micCrestFactor, 0.001)
 
-        // A high crest factor on a near-silent tick shouldn't count -- too
+        // A high crest factor on a near-silent tick shouldn't count — too
         // quiet to plausibly be the chime, more likely mic noise floor.
         val quietSpike = engine.update(0.0001, true, 0.0001 * 12.0, 0.1, 1.0, null, 500L)
         assertFalse(quietSpike.micChimeCandidate)
@@ -275,14 +275,14 @@ class InferenceEngineTest {
             magnet += 0.4
             result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
         }
-        // t=3750, elapsed=1750 -- still short of the assisted 1800ms.
+        // t=3750, elapsed=1750 — still short of the assisted 1800ms.
         assertEquals(3_750L, now)
         assertEquals("运行", result.trainState)
 
         now += 250L
         magnet += 0.4
         result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
-        // t=4000, elapsed=2000 -- past the assisted 1800ms requirement
+        // t=4000, elapsed=2000 — past the assisted 1800ms requirement
         // (would have needed to wait until t=5000 without the assist).
         assertEquals("agree", result.magnetAssistNote)
         assertEquals("停站", result.trainState)
@@ -321,7 +321,7 @@ class InferenceEngineTest {
             magnet += 0.4
             result = engine.update(0.0022, true, 0.0, 0.1, 1.0, magnet, now)
         }
-        // t=4500, elapsed=2250 -- would already be confirmed without the
+        // t=4500, elapsed=2250 — would already be confirmed without the
         // assist (past the fixed 1750ms), but the disagreeing magnet
         // reading should still be holding it back.
         assertEquals(4_500L, now)
@@ -331,7 +331,7 @@ class InferenceEngineTest {
         now += 250L
         magnet += 0.4
         result = engine.update(0.0022, true, 0.0, 0.1, 1.0, magnet, now)
-        // t=4750, elapsed=2500 -- past the assisted 2450ms requirement.
+        // t=4750, elapsed=2500 — past the assisted 2450ms requirement.
         assertEquals("运行", result.trainState)
     }
 
@@ -340,7 +340,7 @@ class InferenceEngineTest {
         // Real-ride field test (2026-09-02): an at-grade light-rail ride's
         // genuine moving noise almost never crossed the mic moving
         // threshold, so mic itself never even attempted a moving candidate
-        // -- the train stayed misread as "停站" for the whole ride. This
+        // — the train stayed misread as "停站" for the whole ride. This
         // covers the deadlock-breaker: a rolling-window majority of magnet
         // candidate reads forcing the transition on its own.
         val engine = InferenceEngine()
@@ -366,7 +366,7 @@ class InferenceEngineTest {
             result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
         }
         // t=8750: 19 "运行" candidate votes have accumulated in the trailing
-        // 20s window -- one short of the 20-sample minimum, so no trigger
+        // 20s window — one short of the 20-sample minimum, so no trigger
         // yet.
         assertEquals(8_750L, now)
         assertEquals("运行", result.magnetCandidateState)
@@ -376,7 +376,7 @@ class InferenceEngineTest {
         magnet += 2.5
         result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
         // t=9000: the 20th vote lands, all of them "运行" (100% >= the 75%
-        // majority requirement) -- magnet forces the transition even though
+        // majority requirement) — magnet forces the transition even though
         // mic never budged from "below stop threshold".
         assertEquals("trigger", result.magnetAssistNote)
         assertEquals("运行", result.trainState)
@@ -386,7 +386,7 @@ class InferenceEngineTest {
     fun magnetIndependentTriggerToleratesIntermittentDisagreement() {
         // Real-ride field test (2026-09-05): within a mis-held "停站"
         // stretch, magnet candidate reads oscillated rather than holding an
-        // unbroken run -- genuine signal, but no continuous streak reached
+        // unbroken run — genuine signal, but no continuous streak reached
         // even 5 seconds (see MAGNET_INDEPENDENT_WINDOW_MS's doc). The
         // rolling-window majority vote tolerates that: a supermajority (not
         // unanimity) of recent candidate reads is enough, so a handful of
@@ -406,7 +406,7 @@ class InferenceEngineTest {
         // with enough of them to briefly flip the smoothed reading to
         // "停站" for a couple of ticks), then back to large jumps. The
         // trigger itself fires on the 23rd tick (index 22) the instant the
-        // rolling-window vote tally clears the 75% majority bar -- one tick
+        // rolling-window vote tally clears the 75% majority bar — one tick
         // later the state has already flipped to "运行" and a fresh
         // mic-driven stop candidate starts agreeing with the (still
         // "停站"-reading) magnet, so this stops right at the trigger tick
@@ -433,7 +433,7 @@ class InferenceEngineTest {
         var now = 0L
 
         // 5 samples of a 120m-accuracy fix spread across the 20s
-        // calibration window -- comfortably past GPS_CALIBRATION_MIN_SAMPLES
+        // calibration window — comfortably past GPS_CALIBRATION_MIN_SAMPLES
         // but 0% of them clear the 20m accuracy gate.
         var result = engine.update(0.0022, true, 0.0, 0.1, 1.0, null, now, null, 120.0)
         repeat(4) {
@@ -463,7 +463,7 @@ class InferenceEngineTest {
         var now = 0L
         val goodAccuracy = 5.0
         // Strictly between the mic stop/moving thresholds during
-        // calibration, so mic itself never settles on a state -- keeps
+        // calibration, so mic itself never settles on a state — keeps
         // stableTrainState at "校准中" until GPS takes over, isolating the
         // GPS state machine's own confirmation timing from mic's (a mic
         // reading confidently inside either band would otherwise confirm
@@ -472,7 +472,7 @@ class InferenceEngineTest {
         // 20s).
         val ambiguousMicRms = 0.0016
         // Once GPS is authoritative, hold mic deep in "stopped" territory
-        // for the rest of the test -- if GPS ever stopped being
+        // for the rest of the test — if GPS ever stopped being
         // authoritative this would pull train_state back to "停站", so a
         // final "运行" result can only mean GPS won.
         val quietMicRms = 0.0005
@@ -499,7 +499,7 @@ class InferenceEngineTest {
         assertEquals("gps-stop-confirmed", result.reason)
 
         // GPS speed now says moving; mic RMS is unchanged (still deep in
-        // "stopped" territory) -- GPS should win once its own 1500ms
+        // "stopped" territory) — GPS should win once its own 1500ms
         // confirmation elapses.
         repeat(7) {
             now += 250L

@@ -14,7 +14,7 @@ object AudioRecoveryPolicy {
     // (2026-09-02): a single zero-PCM event triggered by a brief OS-level
     // audio-focus loss (switching apps while wearing headphones) was enough
     // to permanently switch this device to MIC for the rest of the
-    // recording -- even though UNPROCESSED itself wasn't actually broken,
+    // recording — even though UNPROCESSED itself wasn't actually broken,
     // it just needed a moment to recover. MIC produces RMS values on a very
     // different (much louder, ~100x in that ride) scale than UNPROCESSED,
     // and nothing re-derives the train-state thresholds for that, so the

@@ -11,7 +11,7 @@ extends Control
 #
 # 操作：点/触屏幕左半边=换到左边车道，右半边=换到右边车道。
 
-# ---- 实地测试后需要回来调的常量 ----
+# ==== 实地测试后需要回来调的常量 ====
 # accel_rms / gyro_rms_deg_s 的真实取值范围目前是拍的，先跑几趟地铁，对照
 # DebugLabel 里显示的原始数值和 intensity，再回来改这四个 min/max。
 @export var accel_rms_min: float = 0.0
@@ -110,7 +110,7 @@ func _process(delta: float) -> void:
 	_update_debug_label()
 
 
-# ---- 玩家与操作 ----
+# ==== 玩家与操作 ====
 
 func _spawn_player() -> void:
 	player = ColorRect.new()
@@ -141,7 +141,7 @@ func _unhandled_input(event: InputEvent) -> void:
 	_reposition_player()
 
 
-# ---- GameLink 数据 -> 状态机 ----
+# ==== GameLink 数据 -> 状态机 ====
 
 func _on_link_connected_changed(is_connected: bool) -> void:
 	if is_connected:
@@ -214,7 +214,7 @@ func _set_state(new_state: int) -> void:
 	_update_stats_label()
 
 
-# ---- 竞速关（运行态） ----
+# ==== 竞速关（运行态） ====
 
 func _update_race(delta: float) -> void:
 	spawn_timer -= delta
@@ -281,7 +281,7 @@ func _update_debug_label() -> void:
 	]
 
 
-# ---- 停站补给：三选一（先用三张纯数值卡占位，正式美术/文案后补） ----
+# ==== 停站补给：三选一（先用三张纯数值卡占位，正式美术/文案后补） ====
 
 func _show_upgrade_choice() -> void:
 	if upgrade_shown_this_stop:
@@ -305,7 +305,7 @@ func _on_upgrade_chosen(index: int) -> void:
 	upgrade_overlay.visible = false
 
 
-# ---- 结算（socket 断开 = 下车） ----
+# ==== 结算（socket 断开 = 下车） ====
 
 func _show_summary() -> void:
 	_set_state(GameState.SUMMARY)
@@ -332,7 +332,7 @@ func _on_restart_pressed() -> void:
 	_set_state(GameState.CALIBRATING if GameLink.is_connected else GameState.WAITING)
 
 
-# ---- 编辑器里没连真机时，用假数据先跑一遍手感（只在从未连接过真机时生效） ----
+# ==== 编辑器里没连真机时，用假数据先跑一遍手感（只在从未连接过真机时生效） ====
 
 func _advance_simulation(delta: float) -> void:
 	sim_timer -= delta

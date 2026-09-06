@@ -21,7 +21,7 @@ data class InferenceResult(
     val thresholdMode: String,
     // Despite the field names (kept for CSV schema stability), these are no
     // longer a combined-history P25/P70: micP25 is the P75 of recent "停站"-only
-    // samples and micP70 is the P25 of recent "运行"-only samples -- the raw
+    // samples and micP70 is the P25 of recent "运行"-only samples — the raw
     // percentiles the dynamic thresholds below are derived from.
     val micP25: Double?,
     val micP70: Double?,
@@ -29,7 +29,7 @@ data class InferenceResult(
     // Cheap "did we maybe just hear the fixed station announcement chime"
     // signal: a station announcement is loud but brief, so it barely moves
     // the windowed RMS average while still producing a sharp instantaneous
-    // peak -- i.e. an abnormally high peak/rms ratio for that tick. This is
+    // peak — i.e. an abnormally high peak/rms ratio for that tick. This is
     // logged for field-testing only; it does not currently feed into the
     // train-state decision above.
     val micCrestFactor: Double,
@@ -40,17 +40,17 @@ data class InferenceResult(
     // windowed RMS rather than spiking the peak): compares this tick's RMS
     // to the median RMS from a few seconds earlier. Also logged only, not
     // yet used by the train-state decision. Field-test note: this only
-    // shows a bump while the recent baseline itself was quiet -- once the
+    // shows a bump while the recent baseline itself was quiet — once the
     // train is already loud (moving), both this and the announcement/alarm
     // sound get buried in ambient noise and the ratio stays ~1.0x.
     val micBaselineRms: Double?,
     val micRmsBumpRatio: Double,
     val micRmsBumpCandidate: Boolean,
     // Tick-to-tick change in raw magnetometer field strength (orientation-
-    // independent -- unlike compass_heading_deg, which also picks up the
+    // independent — unlike compass_heading_deg, which also picks up the
     // phone's own rotation when the player is holding/moving it). Field
     // test (2026-08-28) found this reads consistently lower while stopped
-    // than while moving (2.3x-4.6x higher moving, across two rides) -- a
+    // than while moving (2.3x-4.6x higher moving, across two rides) — a
     // plausible read is electromagnetic interference from the traction
     // motor while it's actually drawing power. Null when no magnetometer
     // sample is available. Logged only; not yet used by the train-state
@@ -58,7 +58,7 @@ data class InferenceResult(
     val magnetMagnitudeJitter: Double?,
     // Smoothed (median over the last MAGNET_SMOOTHING_WINDOW_MS) version of
     // magnetMagnitudeJitter above. The raw per-tick jitter overlaps too much
-    // between "运行"/"停站" to threshold directly -- across 11 real rides the
+    // between "运行"/"停站" to threshold directly — across 11 real rides the
     // moving/stopped medians separated cleanly (1.5x-5x) but the P25-moving
     // vs P75-stopped quartiles overlapped in most of them. The windowed
     // median is far less noisy. Null until enough samples have accumulated
@@ -67,7 +67,7 @@ data class InferenceResult(
     // "运行"/"停站"/null (ambiguous, or not enough data yet) candidate
     // reading from the magnet channel alone, using the same per-state
     // dynamic-threshold technique as the mic channel below. This does NOT
-    // independently drive train_state -- see magnetAssistNote.
+    // independently drive train_state — see magnetAssistNote.
     val magnetCandidateState: String?,
     // Whether/how the magnet candidate above adjusted the mic-driven
     // confirmation timer this tick: "agree" shortens the remaining
@@ -81,12 +81,12 @@ data class InferenceResult(
     val magnetAssistNote: String,
     // Echoes of this tick's GPS input, for CSV inspection/comparison. Null
     // whenever no fix was available this tick (no permission, no provider,
-    // underground, or the last fix went stale -- see GpsCollector).
+    // underground, or the last fix went stale — see GpsCollector).
     val gpsSpeedMps: Double?,
     val gpsAccuracyM: Double?,
     // "校准中" (still inside the one-time accuracy-test window) / "可用"
-    // (test passed -- GPS is now authoritative for the rest of the ride) /
-    // "不可用" (test failed -- permanently ignoring GPS for this ride). See
+    // (test passed — GPS is now authoritative for the rest of the ride) /
+    // "不可用" (test failed — permanently ignoring GPS for this ride). See
     // GPS_CALIBRATION_WINDOW_MS's doc for the test itself.
     val gpsCalibrationStatus: String,
     // "运行"/"停站"/null candidate reading from GPS speed alone, using the
@@ -113,7 +113,7 @@ class InferenceEngine {
         // ordinary train/cabin noise (checked against real ride recordings).
         // The fixed station announcement chime is short enough that it barely
         // raises the windowed RMS average while still spiking the peak, so a
-        // much higher ratio is the cheap tell -- no new audio processing
+        // much higher ratio is the cheap tell — no new audio processing
         // needed, mic_peak/mic_rms are already collected every tick.
         const val MIC_CHIME_CREST_FACTOR_THRESHOLD = 8.0
         const val MIC_CHIME_MIN_PEAK = 0.008
@@ -125,7 +125,7 @@ class InferenceEngine {
         // Real-ride field test (2026-08-28): a quiet-baseline announcement
         // or door-alarm produced a 1.5x-3.3x bump; 1.8x sits below all of
         // those while still comfortably above ordinary tick-to-tick RMS
-        // jitter. Not tuned much beyond that -- expect to revisit once more
+        // jitter. Not tuned much beyond that — expect to revisit once more
         // field data comes in.
         const val MIC_BUMP_LOOKBACK_MS = 6_000L
         const val MIC_BUMP_GAP_MS = 1_000L
@@ -172,7 +172,7 @@ class InferenceEngine {
 
         // Deadlock-breaker fallback: on some routes mic RMS never reliably
         // crosses its own threshold in either direction (2026-09-02 field
-        // test -- a quiet at-grade light-rail ride spent >97% of the ride
+        // test — a quiet at-grade light-rail ride spent >97% of the ride
         // stuck showing "停站" because genuine moving noise almost never
         // crossed the moving threshold, so mic itself never even attempted a
         // moving candidate for the magnet assist above to speed up).
@@ -180,8 +180,8 @@ class InferenceEngine {
         // First cut of this (an unbroken-streak requirement) turned out too
         // strict: real-ride field test (2026-09-05) found a 137-second
         // mis-held "停站" stretch that contained a clean ~20s window where
-        // 93-100% of magnet_candidate_state readings said "运行" -- genuine
-        // signal -- but no single unbroken run inside it reached even 5
+        // 93-100% of magnet_candidate_state readings said "运行" — genuine
+        // signal — but no single unbroken run inside it reached even 5
         // seconds, because the smoothed magnet reading itself flickers
         // tick-to-tick near the threshold. A rolling-window majority vote
         // tolerates that flicker while still requiring strong, sustained
@@ -200,7 +200,7 @@ class InferenceEngine {
         private const val MIN_HYSTERESIS_GAP = 0.0002
         // Real-ride field test (2026-09-02): an at-grade light-rail ride's
         // whole cabin was quiet enough that genuine moving-noise RMS sat
-        // around 0.0013 -- below the old MIN_MOVING_THRESHOLD (0.0016), so
+        // around 0.0013 — below the old MIN_MOVING_THRESHOLD (0.0016), so
         // the dynamic threshold could never track down to it even once
         // enough "运行"-labeled history existed. Lowered both bounds enough
         // to cover that ride while still leaving MIN_HYSTERESIS_GAP of room
@@ -211,7 +211,7 @@ class InferenceEngine {
         private const val MAX_MOVING_THRESHOLD = 0.0030
 
         // GPS as an optional primary signal ("位准", 2026-09-06 request):
-        // unlike the magnet channel above, this is not an assist -- once a
+        // unlike the magnet channel above, this is not an assist — once a
         // fix proves accurate enough during a one-time test at the start of
         // the ride, GPS-derived ground speed becomes the SOLE authority for
         // train_state for the rest of that ride, and the mic/magnet fusion
@@ -220,20 +220,20 @@ class InferenceEngine {
         // background, but neither can move stableTrainState anymore).
         //
         // This is deliberately opt-in per ride rather than a hard
-        // requirement: if the window ends without enough accurate fixes --
+        // requirement: if the window ends without enough accurate fixes —
         // the expected case underground, where GPS often gets no fix at all
-        // -- GPS is given up on for the rest of that ride and the mic/magnet
+        // — GPS is given up on for the rest of that ride and the mic/magnet
         // logic stays authoritative, exactly as if GPS didn't exist. The
         // decision is made once and never re-tried mid-ride, so a route that
         // starts underground (test fails) and later surfaces will not
-        // retroactively pick GPS back up -- acceptable for now since the
+        // retroactively pick GPS back up — acceptable for now since the
         // routes this matters for (a quiet at-grade light rail) have GPS
         // available from the very start.
         //
         // ACCESS_COARSE_LOCATION alone (already used for the one-shot
         // magnetic-declination fix in SensorCollector) only unlocks
         // NETWORK_PROVIDER, whose accuracy is routinely worse than
-        // GPS_ACCURACY_THRESHOLD_M -- ACCESS_FINE_LOCATION is required for
+        // GPS_ACCURACY_THRESHOLD_M — ACCESS_FINE_LOCATION is required for
         // this to ever pass the test. See GpsCollector for the actual fix
         // subscription.
         const val GPS_CALIBRATION_WINDOW_MS = 20_000L
@@ -241,7 +241,7 @@ class InferenceEngine {
         const val GPS_ACCURACY_THRESHOLD_M = 20.0
         const val GPS_CALIBRATION_MIN_GOOD_RATIO = 0.6
 
-        // First-cut speed thresholds/confirmation windows -- not yet
+        // First-cut speed thresholds/confirmation windows — not yet
         // validated against real GPS logs the way the mic/magnet numbers
         // above were (no field data with GPS enabled exists yet). GPS speed
         // is a fairly direct measurement of ground speed (unlike the mic RMS
@@ -283,7 +283,7 @@ class InferenceEngine {
     )
 
     private val micHistory = ArrayDeque<MicPoint>()
-    // Short rolling window feeding the baseline-bump detector -- separate
+    // Short rolling window feeding the baseline-bump detector — separate
     // from micHistory above, which only keeps samples once the train state
     // is stable and is used for the (much longer, 3-minute) dynamic
     // threshold calculation instead.
@@ -895,7 +895,7 @@ class InferenceEngine {
         }
 
         if (speedMps == null) {
-            // Fix temporarily lost (e.g. a brief tunnel) -- hold whatever
+            // Fix temporarily lost (e.g. a brief tunnel) — hold whatever
             // state GPS last confirmed rather than falling back to mic. If
             // field data shows routes that lose the fix for long stretches
             // mid-ride, this is the place to revisit a mic fallback; not

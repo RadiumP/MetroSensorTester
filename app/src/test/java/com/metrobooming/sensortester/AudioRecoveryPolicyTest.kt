@@ -58,7 +58,7 @@ class AudioRecoveryPolicyTest {
     fun zeroFailureRetriesUnprocessedOnceBeforeFallingBackToMic() {
         // Real-ride field test (2026-09-02): a single transient zero-PCM
         // event (OS audio-focus loss from switching apps while wearing
-        // headphones) shouldn't be enough to abandon UNPROCESSED -- give it
+        // headphones) shouldn't be enough to abandon UNPROCESSED — give it
         // one retry first.
         assertEquals(
             AudioSourceMode.UNPROCESSED,

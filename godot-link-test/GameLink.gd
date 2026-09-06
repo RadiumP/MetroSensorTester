@@ -3,8 +3,8 @@ extends Node
 # Singleton (autoload as "GameLink") that owns the TCP connection to
 # MetroSensorTester and re-broadcasts each parsed JSON line as a signal.
 #
-# Extracted from the original verification client (Main.gd) so any scene --
-# the real game, or a future debug scene -- can share one connection instead
+# Extracted from the original verification client (Main.gd) so any scene —
+# the real game, or a future debug scene — can share one connection instead
 # of each opening its own socket.
 
 signal connected_changed(is_connected: bool)

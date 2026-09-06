@@ -8,7 +8,7 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <!-- Needed for continuous GPS_PROVIDER fixes (InferenceEngine's optional
-         GPS calibration/authority signal, see GpsCollector) -- coarse alone
+         GPS calibration/authority signal, see GpsCollector); coarse alone
          only unlocks NETWORK_PROVIDER, whose accuracy can't pass the
          calibration test. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />

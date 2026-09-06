@@ -12,7 +12,7 @@ import android.os.SystemClock
 
 /**
  * Continuous GPS fixes feeding the optional "位准" (ground-truth) signal in
- * InferenceEngine -- see GPS_CALIBRATION_WINDOW_MS's doc there for the
+ * InferenceEngine — see GPS_CALIBRATION_WINDOW_MS's doc there for the
  * calibrate-then-decide design. Deliberately separate from
  * SensorCollector's existing one-shot getLastKnownLocation() call (used only
  * to fetch magnetic declination once): that call never subscribes to
@@ -20,7 +20,7 @@ import android.os.SystemClock
  *
  * ACCESS_COARSE_LOCATION alone only unlocks NETWORK_PROVIDER, whose accuracy
  * (typically tens to hundreds of meters) is too poor to ever pass
- * InferenceEngine's calibration test -- ACCESS_FINE_LOCATION is requested so
+ * InferenceEngine's calibration test — ACCESS_FINE_LOCATION is requested so
  * GPS_PROVIDER is usable, but network updates are still subscribed to as a
  * harmless second source (the accuracy gate downstream simply rejects them
  * when they're not good enough).
@@ -33,7 +33,7 @@ class GpsCollector(private val context: Context) {
     )
 
     companion object {
-        // A fix this old is treated as no fix at all -- e.g. the phone just
+        // A fix this old is treated as no fix at all — e.g. the phone just
         // entered a tunnel and the last known speed/accuracy no longer
         // describes "now". Deliberately shorter than
         // InferenceEngine.GPS_CALIBRATION_WINDOW_MS so a dead GPS shows up
@@ -91,7 +91,7 @@ class GpsCollector(private val context: Context) {
             listening = true
         } catch (_: SecurityException) {
             // Permission revoked between the check above and the call, or
-            // the OEM location stack refuses it outright -- treat this
+            // the OEM location stack refuses it outright — treat this
             // exactly like "no GPS available", which the calibration
             // accuracy test in InferenceEngine already handles by giving up
             // on GPS for the ride.
