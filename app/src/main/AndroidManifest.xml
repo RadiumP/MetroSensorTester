@@ -12,6 +12,18 @@
          only unlocks NETWORK_PROVIDER, whose accuracy can't pass the
          calibration test. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Real-ride field test (2026-09-06) found GPS fixes essentially stop
+         arriving whenever the app is backgrounded (fix age climbed past 200s
+         during a 227s background stretch) even though RecordingService keeps
+         running as a foreground service; Android only exempts a foreground
+         service from the background location cutoff when the service itself
+         declares foregroundServiceType="location" AND the app holds
+         ACCESS_BACKGROUND_LOCATION; a plain "while in use" grant only covers
+         updates while the app is actually in the foreground. See
+         RecordingService's foregroundServiceType and MainActivity's location
+         settings prompt. -->
+    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <!-- Local loopback socket only (see GameLinkServer.kt); Android still
          requires INTERNET for any socket, even 127.0.0.1-only traffic. -->
     <uses-permission android:name="android.permission.INTERNET" />
@@ -40,7 +52,7 @@
         <service
             android:name=".RecordingService"
             android:exported="false"
-            android:foregroundServiceType="microphone"
+            android:foregroundServiceType="microphone|location"
             android:stopWithTask="false" />
 
         <activity

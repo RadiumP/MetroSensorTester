@@ -385,11 +385,32 @@ class RecordingService : Service() {
         if (foregroundServiceActive) return
         val notification = buildNotification("正在准备采集")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
-            )
+            // Declaring the "location" foreground-service type (on top of the
+            // existing "microphone" one) is what actually exempts GpsCollector's
+            // updates from Android's background location cutoff — a real-ride
+            // field test (2026-09-06) found GPS fixes effectively stopped
+            // arriving whenever the app was backgrounded even with this service
+            // already running in the foreground, because a plain "while in use"
+            // grant plus a microphone-only foreground service type isn't enough;
+            // Android only keeps delivering continuous fixes to a backgrounded
+            // app when a location-typed foreground service is active AND the
+            // app holds ACCESS_BACKGROUND_LOCATION (requested from MainActivity,
+            // see its location-settings prompt). Only add the location type
+            // when a location permission is actually held — declaring it
+            // without one throws on recent Android versions — so a user who
+            // denied location still gets the microphone-only foreground service
+            // exactly as before.
+            val hasLocationPermission =
+                checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED ||
+                checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            val serviceType = if (hasLocationPermission) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            startForeground(NOTIFICATION_ID, notification, serviceType)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }

@@ -58,6 +58,9 @@
 - **定位丢失**：判定"可用"之后如果某个 tick 拿不到新定位（比如短暂进隧道），会保持上一次 GPS 确认的状态不变，不会退回麦克风判定——如果以后发现有路线会长时间中途失去信号，这里需要重新设计一个中途回退机制，本版本还没做。
 - CSV 新增字段：`gps_speed_mps` / `gps_accuracy_m`（当 tick 定位有效时的原始值，否则为空）、`gps_fix_age_ms`（当前定位距上次更新过了多久，超过 5 秒视为无定位）、`gps_calibration_status`（`校准中`/`可用`/`不可用`）、`gps_candidate_state`（GPS 通道自己的候选方向，只有"可用"时才非空）、`gps_stop_candidate_elapsed_ms` / `gps_moving_candidate_elapsed_ms`（GPS 候选已确认计时多久）。
 - 权限：需要 `ACCESS_FINE_LOCATION` 才能订阅 `GPS_PROVIDER` 的连续定位——仅有粗略定位权限（原本给罗盘真北用的那个）只能订阅 `NETWORK_PROVIDER`，精度通常几十到几百米，几乎不可能通过校准测试。拒绝精确定位权限不影响其余功能，校准测试自然会判定"不可用"。
+- **后台定位限制（2026-09-06 实地测试发现）**：一趟 878 秒的地铁实测里，`app_in_foreground=0`（切到后台/锁屏）的采样点占了约三分之二，这些采样点里 `gps_fix_age_ms` 中位数高达 68.8 秒（前台时中位数只有 0.44 秒），`gps_speed_mps` 非空比例从前台的 79% 掉到后台的 7%——GPS 更新基本停摆，最长一段后台期间（227 秒）定位年龄一路涨到 221.8 秒都没有新定位。原因是 Android 从 10 开始，只有前台使用中的应用才能收到持续 GPS 更新；即使有前台服务在跑，也只有该前台服务本身声明了 `location` 类型、并且应用持有 `ACCESS_BACKGROUND_LOCATION` 权限时，才会被系统豁免这个限制——本版本之前两者都没做（`RecordingService` 的前台服务类型只声明了 `microphone`），所以只要用户切走 app 或锁屏，GPS 就形同虚设。
+  - 修复：`RecordingService` 的 `foregroundServiceType` 改成 `microphone|location`（仅在已授予任一位置权限时才在 `startForeground` 里附带 `FOREGROUND_SERVICE_TYPE_LOCATION`，避免没给权限时因为声明了用不了的类型而抛异常），并新增 `ACCESS_BACKGROUND_LOCATION`/`FOREGROUND_SERVICE_LOCATION` 两个权限。但 `ACCESS_BACKGROUND_LOCATION` 从 Android 11 开始不能再跟其他定位权限一起弹一个运行时对话框申请——系统会直接忽略这部分请求，必须引导用户去系统设置里手动把定位权限从"仅使用时允许"改成"始终允许"。因此界面加了一个"位置设置（后台 GPS）"按钮直接跳转本应用的系统设置页；开始采集时如果精确定位权限已给但后台定位权限没给（且系统版本 >= Android 11），会弹 Toast 提示用户点这个按钮手动开启。
+  - 这个修复还没有实地验证过（写下这段文档时还没有新的一趟数据），下次测试时应该重点看新版本里后台期间 `gps_fix_age_ms` 是否还会像之前那样一路涨上去。
 
 ## 麦克风可靠性
 

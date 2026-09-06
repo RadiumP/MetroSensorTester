@@ -15,6 +15,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -122,6 +123,16 @@ class MainActivity : Activity() {
         labels.addView(button("广播") { markBroadcastHeard() }, weighted())
         labels.addView(button("清除标记") { setMark("") }, weighted())
         root.addView(labels)
+
+        // Real-ride field test (2026-09-06) found GPS fixes basically stop
+        // arriving once the app is backgrounded unless "始终允许" (Allow all
+        // the time) is granted — Android 11+ refuses to surface that choice
+        // through a normal requestPermissions() dialog bundled with the
+        // foreground location request, so the only reliable path is sending
+        // the user to this app's own system settings page to flip it by
+        // hand. See requestStart's Toast and RecordingService's
+        // foregroundServiceType doc for the rest of the fix.
+        root.addView(button("位置设置（后台 GPS）") { openLocationSettings() })
 
         root.addView(section("实时状态"))
         valuesText = text("等待采集服务", 15f, Color.WHITE).also {
@@ -317,7 +328,29 @@ class MainActivity : Activity() {
                 "未授予精确位置权限：GPS 校准测试不会通过，本次仍使用麦克风/磁场判定",
                 Toast.LENGTH_LONG,
             ).show()
+        } else if (
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            // Can't request ACCESS_BACKGROUND_LOCATION through a normal
+            // requestPermissions() dialog on Android 11+ — the system
+            // silently ignores it when bundled with a foreground location
+            // request. Point at the settings button instead of trying.
+            Toast.makeText(
+                this,
+                "未授予后台定位权限：应用切到后台或锁屏后 GPS 大概率会停止更新。" +
+                    "如需锁屏/切后台也保留 GPS，请点「位置设置」把定位权限改成「始终允许」",
+                Toast.LENGTH_LONG,
+            ).show()
         }
+    }
+
+    private fun openLocationSettings() {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.fromParts("package", packageName, null)
+        }
+        startActivity(intent)
     }
 
     private fun startRecording() {
