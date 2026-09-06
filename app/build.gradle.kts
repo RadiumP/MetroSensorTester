@@ -11,8 +11,8 @@ android {
         applicationId = "com.metrobooming.sensortester"
         minSdk = 26
         targetSdk = 34
-        versionCode = 11
-        versionName = "1.9.0"
+        versionCode = 13
+        versionName = "1.11.0"
     }
 
     buildTypes {

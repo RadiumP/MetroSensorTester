@@ -333,4 +333,86 @@ class InferenceEngineTest {
         // t=4750, elapsed=2500 -- past the assisted 2450ms requirement.
         assertEquals("运行", result.trainState)
     }
+
+    @Test
+    fun magnetIndependentlyTriggersWhenMicNeverBuildsCandidate() {
+        // Real-ride field test (2026-09-02): an at-grade light-rail ride's
+        // genuine moving noise almost never crossed the mic moving
+        // threshold, so mic itself never even attempted a moving candidate
+        // -- the train stayed misread as "停站" for the whole ride. This
+        // covers the deadlock-breaker: a rolling-window majority of magnet
+        // candidate reads forcing the transition on its own.
+        val engine = InferenceEngine()
+        var now = 0L
+
+        // Get to a stable "停站" state first, with no magnet signal
+        // involved yet.
+        engine.update(0.0010, true, 0.0, 0.1, 1.0, null, now)
+        now += InferenceEngine.STOP_CONFIRMATION_MS
+        var result = engine.update(0.0010, true, 0.0, 0.1, 1.0, null, now)
+        assertEquals("停站", result.trainState)
+
+        // Mic stays confidently below the stop threshold from here on (mic
+        // itself never attempts a moving candidate), but magnet jitter
+        // climbs to a clear, sustained "运行" reading.
+        var magnet = 45.0
+        now += 250L
+        result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now) // first magnet sample, no jitter yet
+
+        repeat(21) {
+            now += 250L
+            magnet += 2.5
+            result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
+        }
+        // t=8750: 19 "运行" candidate votes have accumulated in the trailing
+        // 20s window -- one short of the 20-sample minimum, so no trigger
+        // yet.
+        assertEquals(8_750L, now)
+        assertEquals("运行", result.magnetCandidateState)
+        assertEquals("停站", result.trainState)
+
+        now += 250L
+        magnet += 2.5
+        result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
+        // t=9000: the 20th vote lands, all of them "运行" (100% >= the 75%
+        // majority requirement) -- magnet forces the transition even though
+        // mic never budged from "below stop threshold".
+        assertEquals("trigger", result.magnetAssistNote)
+        assertEquals("运行", result.trainState)
+    }
+
+    @Test
+    fun magnetIndependentTriggerToleratesIntermittentDisagreement() {
+        // Real-ride field test (2026-09-05): within a mis-held "停站"
+        // stretch, magnet candidate reads oscillated rather than holding an
+        // unbroken run -- genuine signal, but no continuous streak reached
+        // even 5 seconds (see MAGNET_INDEPENDENT_WINDOW_MS's doc). The
+        // rolling-window majority vote tolerates that: a supermajority (not
+        // unanimity) of recent candidate reads is enough, so a handful of
+        // "停站" reads mixed into a mostly-"运行" stretch still triggers.
+        val engine = InferenceEngine()
+        var now = 0L
+        engine.update(0.0010, true, 0.0, 0.1, 1.0, null, now)
+        now += InferenceEngine.STOP_CONFIRMATION_MS
+        engine.update(0.0010, true, 0.0, 0.1, 1.0, null, now)
+
+        var magnet = 45.0
+        now += 250L
+        var result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
+
+        // 12 ticks of a large jump (reads as "运行" once the smoothing
+        // window fills), then 10 ticks of a tiny jump (the window fills
+        // with enough of them to briefly flip the smoothed reading to
+        // "停站"), then back to large jumps. The resulting vote tally ends
+        // up 16 "运行" to 4 "停站" (80%) -- comfortably over the 75%
+        // majority bar, but not unanimous.
+        repeat(24) { index ->
+            now += 250L
+            magnet += if (index % 22 < 12) 3.0 else 0.1
+            result = engine.update(0.0010, true, 0.0, 0.1, 1.0, magnet, now)
+        }
+
+        assertEquals("trigger", result.magnetAssistNote)
+        assertEquals("运行", result.trainState)
+    }
 }

@@ -55,19 +55,50 @@ class AudioRecoveryPolicyTest {
     }
 
     @Test
-    fun zeroFailureFallsBackFromUnprocessedToMic() {
+    fun zeroFailureRetriesUnprocessedOnceBeforeFallingBackToMic() {
+        // Real-ride field test (2026-09-02): a single transient zero-PCM
+        // event (OS audio-focus loss from switching apps while wearing
+        // headphones) shouldn't be enough to abandon UNPROCESSED -- give it
+        // one retry first.
+        assertEquals(
+            AudioSourceMode.UNPROCESSED,
+            AudioRecoveryPolicy.sourceAfterZeroFailure(
+                AudioSourceMode.UNPROCESSED,
+                clientSilenced = false,
+                unprocessedZeroFailureCount = 1,
+            )
+        )
+        // A second consecutive failure is enough evidence to escalate.
         assertEquals(
             AudioSourceMode.MIC,
             AudioRecoveryPolicy.sourceAfterZeroFailure(
                 AudioSourceMode.UNPROCESSED,
                 clientSilenced = false,
+                unprocessedZeroFailureCount = 2,
             )
         )
+    }
+
+    @Test
+    fun frameworkSilencingNeverFallsBackToMicRegardlessOfFailureCount() {
         assertEquals(
             AudioSourceMode.UNPROCESSED,
             AudioRecoveryPolicy.sourceAfterZeroFailure(
                 AudioSourceMode.UNPROCESSED,
                 clientSilenced = true,
+                unprocessedZeroFailureCount = 5,
+            )
+        )
+    }
+
+    @Test
+    fun alreadyOnMicStaysOnMic() {
+        assertEquals(
+            AudioSourceMode.MIC,
+            AudioRecoveryPolicy.sourceAfterZeroFailure(
+                AudioSourceMode.MIC,
+                clientSilenced = false,
+                unprocessedZeroFailureCount = 0,
             )
         )
     }

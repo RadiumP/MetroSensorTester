@@ -74,6 +74,7 @@ class AudioCollector(context: Context) {
     private var routeChangeCount = 0
     private var routedDeviceId: Int? = null
     private var restartReason = "initial-start"
+    private var unprocessedZeroFailureCount = 0
 
     @SuppressLint("MissingPermission")
     fun start(): Boolean = synchronized(lifecycleLock) {
@@ -98,6 +99,7 @@ class AudioCollector(context: Context) {
             routeChangeCount = 0
             routedDeviceId = null
             restartReason = "initial-start"
+            unprocessedZeroFailureCount = 0
             deviceName = "正在启动"
         }
         createAndStartRecorder()
@@ -165,9 +167,13 @@ class AudioCollector(context: Context) {
             synchronized(lock) {
                 val zeroFailure = recorder != null && latestQuality.quality == QUALITY_ZERO_ABNORMAL
                 if (zeroFailure) {
+                    if (sourceMode == AudioSourceMode.UNPROCESSED) {
+                        unprocessedZeroFailureCount++
+                    }
                     sourceMode = AudioRecoveryPolicy.sourceAfterZeroFailure(
                         sourceMode,
                         latestClientSilenced,
+                        unprocessedZeroFailureCount,
                     )
                 }
                 restartCount++

@@ -109,6 +109,15 @@ class RecordingService : Service() {
     private var segmentId = 0
     private var foregroundServiceActive = false
     private var lastNotificationAt = 0L
+    // Tracks AudioCollector's reported audio_source so a mid-session fallback
+    // (e.g. AudioRecoveryPolicy giving up on UNPROCESSED and switching to MIC
+    // after repeated zero-PCM failures) is noticed. Different sources can
+    // read on very different RMS scales on the same device -- real-ride
+    // field test (2026-09-02) saw ~100x -- so the mic RMS history and
+    // thresholds learned under the old source are no longer meaningful once
+    // it changes; resetting lets the engine recalibrate from scratch instead
+    // of silently misjudging train_state against a stale scale.
+    private var lastAudioSource: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -195,6 +204,7 @@ class RecordingService : Service() {
         if (recording) return
         synchronized(rowLock) { rows.clear() }
         inference.reset()
+        lastAudioSource = null
         currentMark = ""
         segmentId = 0
         // elapsedRealtime, not currentTimeMillis: the wall clock can jump when the
@@ -229,6 +239,13 @@ class RecordingService : Service() {
             val wallClockNow = System.currentTimeMillis()
             val sensor = sensors.takeSnapshot()
             val mic = audio.takeSnapshot(now)
+            if (lastAudioSource != null && lastAudioSource != mic.audioSource) {
+                // The RMS scale this reading is on may have just changed
+                // (see lastAudioSource doc above) -- any history/dynamic
+                // thresholds learned so far are no longer trustworthy.
+                inference.reset()
+            }
+            lastAudioSource = mic.audioSource
             audio.restartIfNeeded(now)
             val gyroRmsDeg = sensor.gyroRms * 180.0 / PI
             val gyroPeakDeg = sensor.gyroPeak * 180.0 / PI

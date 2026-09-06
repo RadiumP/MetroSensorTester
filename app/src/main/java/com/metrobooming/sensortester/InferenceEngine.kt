@@ -73,8 +73,11 @@ data class InferenceResult(
     // confirmation timer this tick: "agree" shortens the remaining
     // confirmation time, "disagree" lengthens it, "none" leaves it
     // unchanged (no active mic candidate this tick, or magnet has no
-    // opinion). Mic RMS stays the primary decision signal either way --
-    // this only nudges how fast/cautiously it gets to act.
+    // opinion). "trigger" is the rare last-resort case: a rolling-window
+    // majority of magnet candidate reads disagreed with the held state
+    // (see MAGNET_INDEPENDENT_WINDOW_MS's doc) and forced the transition
+    // itself, because mic never even attempted a candidate for it. Mic
+    // RMS otherwise stays the primary decision signal.
     val magnetAssistNote: String,
     val reason: String,
 )
@@ -151,15 +154,44 @@ class InferenceEngine {
         const val MAGNET_ASSIST_DISAGREE_MULTIPLIER = 1.4
         const val MAGNET_ASSIST_MIN_CONFIRMATION_MS = 500L
 
+        // Deadlock-breaker fallback: on some routes mic RMS never reliably
+        // crosses its own threshold in either direction (2026-09-02 field
+        // test -- a quiet at-grade light-rail ride spent >97% of the ride
+        // stuck showing "停站" because genuine moving noise almost never
+        // crossed the moving threshold, so mic itself never even attempted a
+        // moving candidate for the magnet assist above to speed up).
+        //
+        // First cut of this (an unbroken-streak requirement) turned out too
+        // strict: real-ride field test (2026-09-05) found a 137-second
+        // mis-held "停站" stretch that contained a clean ~20s window where
+        // 93-100% of magnet_candidate_state readings said "运行" -- genuine
+        // signal -- but no single unbroken run inside it reached even 5
+        // seconds, because the smoothed magnet reading itself flickers
+        // tick-to-tick near the threshold. A rolling-window majority vote
+        // tolerates that flicker while still requiring strong, sustained
+        // evidence: count "运行"/"停站" candidate reads over the trailing
+        // window and only trigger once enough of them (MIN_SAMPLES) point
+        // the same way by a clear supermajority (MAJORITY_RATIO).
+        const val MAGNET_INDEPENDENT_WINDOW_MS = 20_000L
+        const val MAGNET_INDEPENDENT_MIN_SAMPLES = 20
+        const val MAGNET_INDEPENDENT_MAJORITY_RATIO = 0.75
+
         private const val DYNAMIC_HISTORY_MS = 180_000L
         private const val MIN_DYNAMIC_SAMPLES = 240
         private const val MIN_SAMPLES_PER_STATE = 20
         private const val THRESHOLD_UPDATE_INTERVAL_MS = 5_000L
         private const val THRESHOLD_SMOOTHING = 0.08
         private const val MIN_HYSTERESIS_GAP = 0.0002
-        private const val MIN_STOP_THRESHOLD = 0.0008
+        // Real-ride field test (2026-09-02): an at-grade light-rail ride's
+        // whole cabin was quiet enough that genuine moving-noise RMS sat
+        // around 0.0013 -- below the old MIN_MOVING_THRESHOLD (0.0016), so
+        // the dynamic threshold could never track down to it even once
+        // enough "运行"-labeled history existed. Lowered both bounds enough
+        // to cover that ride while still leaving MIN_HYSTERESIS_GAP of room
+        // above the stop side.
+        private const val MIN_STOP_THRESHOLD = 0.0005
         private const val MAX_STOP_THRESHOLD = 0.0016
-        private const val MIN_MOVING_THRESHOLD = 0.0016
+        private const val MIN_MOVING_THRESHOLD = 0.0010
         private const val MAX_MOVING_THRESHOLD = 0.0030
 
         private const val STATE_CALIBRATING = "校准中"
@@ -174,6 +206,7 @@ class InferenceEngine {
     private data class RecentMicSample(val timestampMs: Long, val rms: Double)
     private data class MagnetPoint(val timestampMs: Long, val jitterSmoothed: Double, val trainState: String)
     private data class RecentMagnetSample(val timestampMs: Long, val jitter: Double)
+    private data class MagnetCandidateVote(val timestampMs: Long, val state: String)
 
     private val micHistory = ArrayDeque<MicPoint>()
     // Short rolling window feeding the baseline-bump detector -- separate
@@ -198,6 +231,7 @@ class InferenceEngine {
     private var dynamicMagnetStopThreshold: Double? = null
     private var dynamicMagnetMovingThreshold: Double? = null
     private var lastMagnetThresholdUpdateAt = 0L
+    private val magnetCandidateVotes = ArrayDeque<MagnetCandidateVote>()
 
     fun reset() {
         micHistory.clear()
@@ -216,6 +250,7 @@ class InferenceEngine {
         dynamicMagnetStopThreshold = null
         dynamicMagnetMovingThreshold = null
         lastMagnetThresholdUpdateAt = 0L
+        magnetCandidateVotes.clear()
     }
 
     fun update(
@@ -441,6 +476,39 @@ class InferenceEngine {
                 stopCandidateSince = null
                 movingCandidateSince = null
                 reason = "mic-ambiguous-hold-state"
+            }
+        }
+
+        if (magnetCandidateState != null) {
+            magnetCandidateVotes.addLast(MagnetCandidateVote(now, magnetCandidateState))
+        }
+        while (
+            magnetCandidateVotes.firstOrNull()?.timestampMs
+                ?.let { it < now - MAGNET_INDEPENDENT_WINDOW_MS } == true
+        ) {
+            magnetCandidateVotes.removeFirst()
+        }
+        val stoppedVotes = magnetCandidateVotes.count { it.state == STATE_STOPPED }
+        val movingVotes = magnetCandidateVotes.count { it.state == STATE_MOVING }
+        val totalVotes = stoppedVotes + movingVotes
+        if (totalVotes >= MAGNET_INDEPENDENT_MIN_SAMPLES) {
+            val majorityState = when {
+                movingVotes > stoppedVotes -> STATE_MOVING
+                stoppedVotes > movingVotes -> STATE_STOPPED
+                else -> null
+            }
+            val majorityRatio = maxOf(stoppedVotes, movingVotes).toDouble() / totalVotes
+            if (
+                majorityState != null &&
+                majorityState != stableTrainState &&
+                majorityRatio >= MAGNET_INDEPENDENT_MAJORITY_RATIO
+            ) {
+                stableTrainState = majorityState
+                stopCandidateSince = null
+                movingCandidateSince = null
+                magnetAssistNote = "trigger"
+                reason = "magnet-independent-trigger"
+                magnetCandidateVotes.clear()
             }
         }
 
