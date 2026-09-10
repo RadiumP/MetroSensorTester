@@ -28,6 +28,11 @@ data class SensorSnapshot(
     val magnetY: Float?,
     val magnetZ: Float?,
     val magnetMagnitude: Double?,
+    // Accuracy class of the magnetometer specifically, unlike compassAccuracy
+    // below, which falls back to the rotation vector's when the magnetometer
+    // has not reported one. Kept separate because InferenceEngine logs the
+    // magnet channel's own hardware accuracy alongside its usability verdict.
+    val magnetAccuracy: Int?,
     val pressureHpa: Float?,
     val compassActive: Boolean,
     val compassSource: String,
@@ -233,6 +238,7 @@ class SensorCollector(private val context: Context) : SensorEventListener {
                 magnetY = my,
                 magnetZ = mz,
                 magnetMagnitude = magnitude,
+                magnetAccuracy = magnetAccuracy,
                 pressureHpa = pressureHpa,
                 compassActive = heading != null,
                 compassSource = compassSource,

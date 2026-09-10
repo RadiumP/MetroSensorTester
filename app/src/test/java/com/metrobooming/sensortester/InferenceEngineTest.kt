@@ -8,6 +8,18 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class InferenceEngineTest {
+    // The shipped default is currently the magnet-only field-test
+    // configuration (see MIC_DECISION_ENABLED_DEFAULT), under which the mic
+    // channel cannot move train_state at all. Every test below that predates
+    // that switch exercises the mic-primary plus magnet-assist fusion, so it
+    // asks for that configuration explicitly instead of relying on the
+    // defaults; the magnet-primary tests at the bottom of this file use the
+    // defaults.
+    private fun legacyFusionEngine() = InferenceEngine(
+        micDecisionEnabled = true,
+        magnetPrimaryEnabled = false,
+    )
+
     @Test
     fun microphoneQualityDetectsZeroAndRequiresRecovery() {
         val monitor = MicQualityMonitor()
@@ -30,7 +42,7 @@ class InferenceEngineTest {
 
     @Test
     fun stopRequiresThreeContinuousSeconds() {
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         engine.update(0.0022, true, 0.0, 0.1, 1.0, null, 0L)
         assertEquals("运行", engine.update(0.0022, true, 0.0, 0.1, 1.0, null, 1_750L).trainState)
 
@@ -47,7 +59,7 @@ class InferenceEngineTest {
 
     @Test
     fun movingRequiresConfirmationAndAmbiguousBandResetsCandidate() {
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         engine.update(0.0010, true, 0.0, 0.1, 1.0, null, 0L)
         assertEquals("停站", engine.update(0.0010, true, 0.0, 0.1, 1.0, null, 3_000L).trainState)
 
@@ -69,7 +81,7 @@ class InferenceEngineTest {
 
     @Test
     fun invalidMicrophoneHoldsTrainStateAndDoesNotUpdateHistory() {
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         engine.update(0.0022, true, 0.0, 0.1, 1.0, null, 0L)
         engine.update(0.0022, true, 0.0, 0.1, 1.0, null, 1_750L)
         repeat(12) { index ->
@@ -94,7 +106,7 @@ class InferenceEngineTest {
 
     @Test
     fun reportsStoppedWhilePlayerIsActive() {
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         engine.update(0.0010, true, 0.0, 0.1, 1.0, null, 0L)
         val result = engine.update(0.0010, true, 0.0, 0.6, 1.0, null, 3_000L)
 
@@ -106,7 +118,7 @@ class InferenceEngineTest {
 
     @Test
     fun dynamicThresholdsUseMixedValidHistoryAndFreezeOnSingleState() {
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         var now = 0L
         engine.update(0.0024, true, 0.0, 0.1, 1.0, null, now)
         now += InferenceEngine.MOVING_CONFIRMATION_MS
@@ -166,7 +178,7 @@ class InferenceEngineTest {
         // ordinary stop noise, making loud-but-stopped samples misread as
         // moving. Per-state percentiles must keep the moving threshold
         // anchored to the (small) population of genuinely moving samples.
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         var now = 0L
 
         engine.update(0.0009, true, 0.0, 0.1, 1.0, null, now)
@@ -206,7 +218,7 @@ class InferenceEngineTest {
 
     @Test
     fun flagsChimeCandidateOnlyForSharpPeakRelativeToRms() {
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
 
         // Ordinary cabin noise: peak/rms crest factor around 3-4x, as seen in
         // real ride recordings. Should never flag as a chime candidate no
@@ -229,7 +241,7 @@ class InferenceEngineTest {
 
     @Test
     fun computesMagnetMagnitudeJitterAsAbsoluteChangeSinceLastSample() {
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
 
         // No prior sample to compare against yet.
         val first = engine.update(0.0022, true, 0.0, 0.1, 1.0, 45.0, 0L)
@@ -252,7 +264,7 @@ class InferenceEngineTest {
 
     @Test
     fun agreeingMagnetShortensStopConfirmation() {
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         var now = 0L
         var magnet = 45.0
 
@@ -290,7 +302,7 @@ class InferenceEngineTest {
 
     @Test
     fun disagreeingMagnetLengthensMovingConfirmation() {
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         var now = 0L
         var magnet = 45.0
 
@@ -343,7 +355,7 @@ class InferenceEngineTest {
         // — the train stayed misread as "停站" for the whole ride. This
         // covers the deadlock-breaker: a rolling-window majority of magnet
         // candidate reads forcing the transition on its own.
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         var now = 0L
 
         // Get to a stable "停站" state first, with no magnet signal
@@ -391,7 +403,7 @@ class InferenceEngineTest {
         // rolling-window majority vote tolerates that: a supermajority (not
         // unanimity) of recent candidate reads is enough, so a handful of
         // "停站" reads mixed into a mostly-"运行" stretch still triggers.
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         var now = 0L
         engine.update(0.0010, true, 0.0, 0.1, 1.0, null, now)
         now += InferenceEngine.STOP_CONFIRMATION_MS
@@ -429,7 +441,7 @@ class InferenceEngineTest {
         // window (e.g. no real fix, or a degraded one) must permanently give
         // up on GPS for the ride and leave mic/magnet driving train_state
         // exactly as if GPS didn't exist.
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         var now = 0L
 
         // 5 samples of a 120m-accuracy fix spread across the 20s
@@ -459,7 +471,7 @@ class InferenceEngineTest {
         // for train_state, with its own (shorter) confirmation timing,
         // overriding whatever a strongly-disagreeing mic reading would have
         // decided on its own.
-        val engine = InferenceEngine()
+        val engine = legacyFusionEngine()
         var now = 0L
         val goodAccuracy = 5.0
         // Strictly between the mic stop/moving thresholds during
@@ -508,5 +520,121 @@ class InferenceEngineTest {
         assertEquals(23_750L, now)
         assertEquals("运行", result.trainState)
         assertEquals("gps-moving-confirmed", result.reason)
+    }
+
+    // Alternating the raw magnitude between 0 and amp makes every tick's
+    // |magnitude - previous| equal amp exactly, so the smoothed (median)
+    // jitter settles on amp once the smoothing window has refilled. Returns
+    // the last result so a test can assert on the tick it stopped at.
+    private fun feedMagnet(
+        engine: InferenceEngine,
+        amp: Double,
+        ticks: Int,
+        startNow: Long,
+        micRms: Double,
+        flipState: BooleanArray,
+    ): Pair<InferenceResult, Long> {
+        var now = startNow
+        var result: InferenceResult? = null
+        repeat(ticks) {
+            flipState[0] = !flipState[0]
+            val magnitude = if (flipState[0]) amp else 0.0
+            result = engine.update(
+                micRms = micRms,
+                micValid = true,
+                micPeak = micRms * 3.0,
+                accelRms = 0.0,
+                gyroDegreesRms = 0.0,
+                magnetMagnitude = magnitude,
+                now = now,
+                magnetAccuracy = 3,
+            )
+            now += 250L
+        }
+        return result!! to now
+    }
+
+    @Test
+    fun magnetIsRejectedWhenItsJitterNeverReachesTheMovingThreshold() {
+        // Reproduces the 2026-09-06 ride, whose smoothed jitter never once
+        // crossed MAGNET_MOVING_JITTER_THRESHOLD: the channel could only ever
+        // have emitted "停站", so it must be given up on rather than trusted.
+        val engine = InferenceEngine()
+        val flip = BooleanArray(1)
+
+        val (midway, midwayNow) = feedMagnet(engine, 0.5, 400, 0L, 0.0020, flip)
+        assertEquals(InferenceEngine.MAGNET_STATUS_CALIBRATING, midway.magnetCalibrationStatus)
+        assertEquals("校准中", midway.trainState)
+
+        // Past MAGNET_CALIBRATION_MAX_WINDOW_MS the verdict is locked in.
+        val (after, _) = feedMagnet(engine, 0.5, 400, midwayNow, 0.0020, flip)
+        assertEquals(InferenceEngine.MAGNET_STATUS_UNUSABLE, after.magnetCalibrationStatus)
+        assertEquals(0.5, after.magnetCalibrationHighJitter!!, 1e-9)
+        // Mic decisions are off in this configuration, so with magnet given
+        // up on there is nothing left that may move the state.
+        assertEquals("校准中", after.trainState)
+        assertEquals("magnet-unusable-mic-disabled-hold-state", after.reason)
+    }
+
+    @Test
+    fun magnetBecomesPrimaryOnceItsJitterStraddlesItsOwnBand() {
+        val engine = InferenceEngine()
+        val flip = BooleanArray(1)
+        // Deep in mic "stopped" territory for the whole test, so any state
+        // change below can only have come from the magnet channel.
+        val quietMicRms = 0.0005
+
+        val (calibrating, afterLowNow) = feedMagnet(engine, 0.5, 40, 0L, quietMicRms, flip)
+        assertEquals(InferenceEngine.MAGNET_STATUS_CALIBRATING, calibrating.magnetCalibrationStatus)
+        assertEquals("停站", calibrating.magnetCandidateState)
+        assertEquals("校准中", calibrating.trainState)
+        assertNull(calibrating.magnetCalibrationHighJitter)
+
+        // Now the other side of the band shows up, which is what the test is
+        // actually waiting for; the channel passes and immediately starts
+        // confirming its own "运行" candidate.
+        val (usable, afterHighNow) = feedMagnet(engine, 3.0, 40, afterLowNow, quietMicRms, flip)
+        assertEquals(InferenceEngine.MAGNET_STATUS_USABLE, usable.magnetCalibrationStatus)
+        assertEquals(0.5, usable.magnetCalibrationLowJitter!!, 1e-9)
+        assertEquals(3.0, usable.magnetCalibrationHighJitter!!, 1e-9)
+        assertEquals("primary", usable.magnetAssistNote)
+        assertEquals("运行", usable.trainState)
+        assertEquals("magnet-moving-hold", usable.reason)
+
+        // Dropping back to low jitter has to survive both the smoothing
+        // window and MAGNET_STOP_CONFIRMATION_MS before the state follows.
+        val (stillMoving, _) = feedMagnet(engine, 0.5, 24, afterHighNow, quietMicRms, flip)
+        assertEquals("运行", stillMoving.trainState)
+        assertEquals("magnet-stop-confirming", stillMoving.reason)
+
+        val (stopped, _) = feedMagnet(engine, 0.5, 40, afterHighNow + 24 * 250L, quietMicRms, flip)
+        assertEquals("停站", stopped.trainState)
+        assertEquals("magnet-stop-hold", stopped.reason)
+    }
+
+    @Test
+    fun magnetPrimaryLeavesTheStateAloneWhileItsSignalIsMissing() {
+        val engine = InferenceEngine()
+        val flip = BooleanArray(1)
+        val (usable, now) = feedMagnet(engine, 3.0, 40, 0L, 0.0020, flip)
+        // A magnetometer that only ever reads high jitter never shows the
+        // stopped side of the band, so it cannot pass its own test either.
+        assertEquals(InferenceEngine.MAGNET_STATUS_CALIBRATING, usable.magnetCalibrationStatus)
+
+        // No magnetometer sample at all: the smoothing window drains and the
+        // channel reports no reading rather than guessing one.
+        var result = usable
+        var t = now
+        repeat(40) {
+            result = engine.update(
+                micRms = 0.0020, micValid = true, micPeak = 0.006,
+                accelRms = 0.0, gyroDegreesRms = 0.0,
+                magnetMagnitude = null, now = t, magnetAccuracy = null,
+            )
+            t += 250L
+        }
+        assertNull(result.magnetJitterSmoothed)
+        assertNull(result.magnetCandidateState)
+        assertEquals("校准中", result.trainState)
     }
 }

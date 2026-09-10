@@ -77,8 +77,32 @@ data class InferenceResult(
     // majority of magnet candidate reads disagreed with the held state
     // (see MAGNET_INDEPENDENT_WINDOW_MS's doc) and forced the transition
     // itself, because mic never even attempted a candidate for it. Mic
-    // RMS otherwise stays the primary decision signal.
+    // RMS otherwise stays the primary decision signal. "primary" means
+    // the magnet channel drove train_state directly this tick, bypassing
+    // the mic assist entirely (see MAGNET_PRIMARY_ENABLED_DEFAULT).
     val magnetAssistNote: String,
+    // "校准中" / "可用" / "不可用" verdict of the magnet channel's own
+    // usability test. See MAGNET_CALIBRATION_MIN_SAMPLES's doc for what
+    // the test actually measures and why it is not a fixed-length window
+    // like the GPS one.
+    val magnetCalibrationStatus: String,
+    // The two observed percentiles the usability test above compares
+    // against the effective jitter thresholds, echoed for CSV inspection.
+    // Null until enough smoothed samples exist to compute them.
+    val magnetCalibrationLowJitter: Double?,
+    val magnetCalibrationHighJitter: Double?,
+    // Confirmation timers of the magnet channel's own candidate state
+    // machine. Only ever non-zero while the magnet channel is the
+    // authority (magnetAssistNote == "primary").
+    val magnetStopCandidateElapsedMs: Long,
+    val magnetMovingCandidateElapsedMs: Long,
+    // Raw SensorManager accuracy class of the magnetometer (0 unreliable
+    // through 3 high), echoed for CSV inspection only. Deliberately NOT
+    // part of the usability test: on the 2026-09-06 ride this sat at 3
+    // (high) for 90% of the ride while the channel itself was useless,
+    // so it predicts nothing about whether the jitter signal actually
+    // separates the two train states.
+    val magnetAccuracy: Int?,
     // Echoes of this tick's GPS input, for CSV inspection/comparison. Null
     // whenever no fix was available this tick (no permission, no provider,
     // underground, or the last fix went stale — see GpsCollector).
@@ -98,7 +122,13 @@ data class InferenceResult(
     val reason: String,
 )
 
-class InferenceEngine {
+class InferenceEngine(
+    // Constructor-injected rather than read straight off the companion
+    // constants so the test suite can still exercise both configurations;
+    // production callers use the defaults, which are the field-test setting.
+    val micDecisionEnabled: Boolean = MIC_DECISION_ENABLED_DEFAULT,
+    val magnetPrimaryEnabled: Boolean = MAGNET_PRIMARY_ENABLED_DEFAULT,
+) {
     companion object {
         const val MIC_NONZERO_FLOOR = 0.000001
         const val MIC_STOP_RMS_THRESHOLD = 0.0014
@@ -192,6 +222,69 @@ class InferenceEngine {
         const val MAGNET_INDEPENDENT_MIN_SAMPLES = 20
         const val MAGNET_INDEPENDENT_MAJORITY_RATIO = 0.75
 
+        // Magnet channel usability test ("精度判断", 2026-09-10 request).
+        // Same abandon-or-adopt shape as the GPS calibration below, but the
+        // criterion has to be different, for two reasons found in the
+        // 2026-09-05/06/08 ride logs:
+        //
+        // 1. There is no per-sample accuracy number to threshold the way GPS
+        //    has meters. The SensorManager accuracy class looks like the
+        //    obvious analogue and is not: the 2026-09-06 ride reported
+        //    accuracy 3 (high) for 90% of its samples while its jitter
+        //    signal was in fact unusable (P90 of the smoothed jitter reached
+        //    only 0.85, so it never once crossed MAGNET_MOVING_JITTER_
+        //    THRESHOLD; the channel emitted "停站" 2706 times against "运行"
+        //    134 for the whole ride). It is still logged, just not tested.
+        //
+        // 2. What actually matters is whether this phone's jitter signal
+        //    straddles the decision band at all, and that cannot be judged
+        //    from a fixed window at ride start the way GPS accuracy can: at
+        //    t=0 the train is usually still standing in the platform, so a
+        //    narrow spread early on means "hasn't moved yet", not "bad
+        //    sensor". So the test is open-ended instead of fixed-length: it
+        //    passes as soon as the observed distribution has been seen both
+        //    below the stop threshold and above the moving threshold, and
+        //    only gives up if MAX_WINDOW_MS goes by without that happening.
+        //
+        // Checked against the three rides above: 09-05 passes at 28.8s,
+        // 09-08 at 16.0s, and 09-06 is correctly rejected.
+        const val MAGNET_CALIBRATION_MIN_SAMPLES = 60
+        const val MAGNET_CALIBRATION_MAX_WINDOW_MS = 180_000L
+        const val MAGNET_CALIBRATION_LOW_PERCENTILE = 0.10
+        const val MAGNET_CALIBRATION_HIGH_PERCENTILE = 0.90
+
+        // Confirmation windows for the magnet channel's own candidate state
+        // machine, used only when it is the authority (see
+        // MAGNET_PRIMARY_ENABLED_DEFAULT). The smoothed magnet reading flickers
+        // tick-to-tick near the threshold, so these are longer than the mic
+        // equivalents. Swept offline over the 09-05/09-08 logs: at
+        // 2000/1500 the magnet-only classifier produced 91/105 transitions
+        // with 12 segments under 5 seconds in each ride (visible flicker),
+        // at 4000/3000 it settles to 61/69 transitions with only 4 and 2
+        // such segments, and 5000/4000 removes the rest at the cost of
+        // roughly a third of the transitions. 4000/3000 is the starting
+        // point; if the field test still shows flicker, 5000/4000 is the
+        // next step. Note this stacks on top of MAGNET_SMOOTHING_WINDOW_MS,
+        // so the end-to-end reaction time to a real transition is several
+        // seconds either way.
+        const val MAGNET_STOP_CONFIRMATION_MS = 4_000L
+        const val MAGNET_MOVING_CONFIRMATION_MS = 3_000L
+
+        const val MAGNET_STATUS_CALIBRATING = "校准中"
+        const val MAGNET_STATUS_USABLE = "可用"
+        const val MAGNET_STATUS_UNUSABLE = "不可用"
+
+        // Defaults for the two field-test switches (2026-09-10): with the
+        // mic channel off, a ride isolates what the magnet channel can do on
+        // its own. Both flipped back (mic true / magnet false) restores the
+        // mic-primary plus magnet-assist fusion exactly; nothing else in
+        // this file branches on them. Mic RMS keeps being sampled, logged
+        // and folded into its dynamic-threshold history either way, so a
+        // magnet-only ride still records everything needed to compare the
+        // two channels afterwards.
+        const val MIC_DECISION_ENABLED_DEFAULT = false
+        const val MAGNET_PRIMARY_ENABLED_DEFAULT = true
+
         private const val DYNAMIC_HISTORY_MS = 180_000L
         private const val MIN_DYNAMIC_SAMPLES = 240
         private const val MIN_SAMPLES_PER_STATE = 20
@@ -270,6 +363,18 @@ class InferenceEngine {
     private data class MagnetPoint(val timestampMs: Long, val jitterSmoothed: Double, val trainState: String)
     private data class RecentMagnetSample(val timestampMs: Long, val jitter: Double)
     private data class MagnetCandidateVote(val timestampMs: Long, val state: String)
+    private data class MagnetOutcome(
+        val calibrationStatus: String,
+        val usable: Boolean,
+        val lowJitter: Double?,
+        val highJitter: Double?,
+        val stopCandidateElapsedMs: Long,
+        val movingCandidateElapsedMs: Long,
+        // Non-null only when the magnet channel is authoritative this tick;
+        // this then becomes the tick's overall decision reason and the
+        // mic block is bypassed.
+        val reason: String?,
+    )
     private data class GpsOutcome(
         val calibrationStatus: String,
         val usable: Boolean,
@@ -306,6 +411,18 @@ class InferenceEngine {
     private var dynamicMagnetMovingThreshold: Double? = null
     private var lastMagnetThresholdUpdateAt = 0L
     private val magnetCandidateVotes = ArrayDeque<MagnetCandidateVote>()
+    // Smoothed-jitter samples feeding the one-time magnet usability test.
+    // Bounded by MAGNET_CALIBRATION_MAX_WINDOW_MS worth of ticks and dropped
+    // as soon as the verdict is in, so this never grows for a long ride.
+    private val magnetCalibrationSamples = mutableListOf<Double>()
+    private var magnetFirstSampleAt: Long? = null
+    // null = test still running, true/false = decided and locked for the
+    // rest of the ride (same one-shot contract as gpsUsable below).
+    private var magnetUsable: Boolean? = null
+    private var magnetCalibrationLowJitter: Double? = null
+    private var magnetCalibrationHighJitter: Double? = null
+    private var magnetStopCandidateSince: Long? = null
+    private var magnetMovingCandidateSince: Long? = null
     private var gpsFirstUpdateAt: Long? = null
     private val gpsCalibrationAccuracySamples = mutableListOf<Double>()
     // null = calibration window still open (or not yet started); true/false
@@ -333,6 +450,13 @@ class InferenceEngine {
         dynamicMagnetMovingThreshold = null
         lastMagnetThresholdUpdateAt = 0L
         magnetCandidateVotes.clear()
+        magnetCalibrationSamples.clear()
+        magnetFirstSampleAt = null
+        magnetUsable = null
+        magnetCalibrationLowJitter = null
+        magnetCalibrationHighJitter = null
+        magnetStopCandidateSince = null
+        magnetMovingCandidateSince = null
         gpsFirstUpdateAt = null
         gpsCalibrationAccuracySamples.clear()
         gpsUsable = null
@@ -350,6 +474,7 @@ class InferenceEngine {
         now: Long,
         gpsSpeedMps: Double? = null,
         gpsAccuracyM: Double? = null,
+        magnetAccuracy: Int? = null,
     ): InferenceResult {
         val magnetMagnitudeJitter = if (magnetMagnitude != null && lastMagnetMagnitude != null) {
             kotlin.math.abs(magnetMagnitude - lastMagnetMagnitude!!)
@@ -451,6 +576,19 @@ class InferenceEngine {
         }
 
         val gpsOutcome = updateGpsState(gpsSpeedMps, gpsAccuracyM, now)
+        // Runs on every tick regardless of who ends up deciding, so the
+        // usability test keeps making progress (and the CSV keeps showing
+        // its verdict) even on a ride where GPS took over. GPS outranks it
+        // when both are usable, so it only ever claims authority once GPS
+        // has not.
+        val magnetOutcome = updateMagnetState(
+            magnetJitterSmoothed = magnetJitterSmoothed,
+            candidateState = magnetCandidateState,
+            authoritative = magnetPrimaryEnabled && !gpsOutcome.usable,
+            effectiveStopThreshold = effectiveMagnetStopThreshold,
+            effectiveMovingThreshold = effectiveMagnetMovingThreshold,
+            now = now,
+        )
         if (gpsOutcome.usable) {
             // GPS is authoritative for the rest of this ride: bypass the
             // mic/magnet-driven state machine entirely for stableTrainState
@@ -488,6 +626,8 @@ class InferenceEngine {
                 magnetJitterSmoothed = magnetJitterSmoothed,
                 magnetCandidateState = magnetCandidateState,
                 magnetAssistNote = "none",
+                magnetOutcome = magnetOutcome,
+                magnetAccuracy = magnetAccuracy,
                 gpsSpeedMps = gpsSpeedMps,
                 gpsAccuracyM = gpsAccuracyM,
                 gpsCalibrationStatus = gpsOutcome.calibrationStatus,
@@ -495,6 +635,103 @@ class InferenceEngine {
                 gpsStopCandidateElapsedMs = gpsOutcome.stopCandidateElapsedMs,
                 gpsMovingCandidateElapsedMs = gpsOutcome.movingCandidateElapsedMs,
                 reason = gpsOutcome.reason ?: "gps-hold-state",
+            )
+        }
+
+        if (magnetOutcome.reason != null) {
+            // Magnet is the authority for this ride: it has already applied
+            // this tick's decision to stableTrainState. Mic keeps being
+            // sampled and folded into its own history for offline
+            // comparison, but cannot move the state.
+            stopCandidateSince = null
+            movingCandidateSince = null
+            if (
+                micUsable && micRms >= MIC_NONZERO_FLOOR &&
+                (stableTrainState == STATE_MOVING || stableTrainState == STATE_STOPPED)
+            ) {
+                micHistory.addLast(MicPoint(now, micRms, stableTrainState))
+            }
+            return result(
+                micRms = micRms,
+                playerActive = playerActive,
+                playerState = playerState,
+                rawTrainState = magnetCandidateState ?: stableTrainState,
+                effectiveStopThreshold = effectiveStopThreshold,
+                effectiveMovingThreshold = effectiveMovingThreshold,
+                thresholdMode = thresholdMode,
+                micLevelRatio = micLevelRatio,
+                micAboveMovingThreshold = micAboveMovingThreshold,
+                micBelowStopThreshold = micBelowStopThreshold,
+                stopCandidateElapsedMs = 0L,
+                movingCandidateElapsedMs = 0L,
+                micCrestFactor = micCrestFactor,
+                micChimeCandidate = micChimeCandidate,
+                micBaselineRms = micBaselineRms,
+                micRmsBumpRatio = micRmsBumpRatio,
+                micRmsBumpCandidate = micRmsBumpCandidate,
+                magnetMagnitudeJitter = magnetMagnitudeJitter,
+                magnetJitterSmoothed = magnetJitterSmoothed,
+                magnetCandidateState = magnetCandidateState,
+                magnetAssistNote = "primary",
+                magnetOutcome = magnetOutcome,
+                magnetAccuracy = magnetAccuracy,
+                gpsSpeedMps = gpsSpeedMps,
+                gpsAccuracyM = gpsAccuracyM,
+                gpsCalibrationStatus = gpsOutcome.calibrationStatus,
+                gpsCandidateState = gpsOutcome.candidateState,
+                gpsStopCandidateElapsedMs = 0L,
+                gpsMovingCandidateElapsedMs = 0L,
+                reason = magnetOutcome.reason,
+            )
+        }
+
+        if (!micDecisionEnabled) {
+            // Mic decisions are switched off for this build and magnet is
+            // not (yet) authoritative, so nothing may move the state this
+            // tick. Mic history still accumulates for offline comparison.
+            stopCandidateSince = null
+            movingCandidateSince = null
+            if (
+                micUsable && micRms >= MIC_NONZERO_FLOOR &&
+                (stableTrainState == STATE_MOVING || stableTrainState == STATE_STOPPED)
+            ) {
+                micHistory.addLast(MicPoint(now, micRms, stableTrainState))
+            }
+            return result(
+                micRms = micRms,
+                playerActive = playerActive,
+                playerState = playerState,
+                rawTrainState = stableTrainState,
+                effectiveStopThreshold = effectiveStopThreshold,
+                effectiveMovingThreshold = effectiveMovingThreshold,
+                thresholdMode = thresholdMode,
+                micLevelRatio = micLevelRatio,
+                micAboveMovingThreshold = micAboveMovingThreshold,
+                micBelowStopThreshold = micBelowStopThreshold,
+                stopCandidateElapsedMs = 0L,
+                movingCandidateElapsedMs = 0L,
+                micCrestFactor = micCrestFactor,
+                micChimeCandidate = micChimeCandidate,
+                micBaselineRms = micBaselineRms,
+                micRmsBumpRatio = micRmsBumpRatio,
+                micRmsBumpCandidate = micRmsBumpCandidate,
+                magnetMagnitudeJitter = magnetMagnitudeJitter,
+                magnetJitterSmoothed = magnetJitterSmoothed,
+                magnetCandidateState = magnetCandidateState,
+                magnetAssistNote = "none",
+                magnetOutcome = magnetOutcome,
+                magnetAccuracy = magnetAccuracy,
+                gpsSpeedMps = gpsSpeedMps,
+                gpsAccuracyM = gpsAccuracyM,
+                gpsCalibrationStatus = gpsOutcome.calibrationStatus,
+                gpsCandidateState = gpsOutcome.candidateState,
+                gpsStopCandidateElapsedMs = 0L,
+                gpsMovingCandidateElapsedMs = 0L,
+                reason = if (magnetOutcome.calibrationStatus == MAGNET_STATUS_UNUSABLE) {
+                    "magnet-unusable-mic-disabled-hold-state"
+                } else {
+                    "magnet-calibrating-mic-disabled-hold-state"
+                },
             )
         }
 
@@ -523,6 +760,8 @@ class InferenceEngine {
                 magnetJitterSmoothed = magnetJitterSmoothed,
                 magnetCandidateState = magnetCandidateState,
                 magnetAssistNote = "none",
+                magnetOutcome = magnetOutcome,
+                magnetAccuracy = magnetAccuracy,
                 gpsSpeedMps = gpsSpeedMps,
                 gpsAccuracyM = gpsAccuracyM,
                 gpsCalibrationStatus = gpsOutcome.calibrationStatus,
@@ -684,6 +923,8 @@ class InferenceEngine {
             magnetJitterSmoothed = magnetJitterSmoothed,
             magnetCandidateState = magnetCandidateState,
             magnetAssistNote = magnetAssistNote,
+            magnetOutcome = magnetOutcome,
+            magnetAccuracy = magnetAccuracy,
             gpsSpeedMps = gpsSpeedMps,
             gpsAccuracyM = gpsAccuracyM,
             gpsCalibrationStatus = gpsOutcome.calibrationStatus,
@@ -716,6 +957,8 @@ class InferenceEngine {
         magnetJitterSmoothed: Double?,
         magnetCandidateState: String?,
         magnetAssistNote: String,
+        magnetOutcome: MagnetOutcome,
+        magnetAccuracy: Int?,
         gpsSpeedMps: Double?,
         gpsAccuracyM: Double?,
         gpsCalibrationStatus: String,
@@ -762,6 +1005,12 @@ class InferenceEngine {
             magnetJitterSmoothed = magnetJitterSmoothed,
             magnetCandidateState = magnetCandidateState,
             magnetAssistNote = magnetAssistNote,
+            magnetCalibrationStatus = magnetOutcome.calibrationStatus,
+            magnetCalibrationLowJitter = magnetOutcome.lowJitter,
+            magnetCalibrationHighJitter = magnetOutcome.highJitter,
+            magnetStopCandidateElapsedMs = magnetOutcome.stopCandidateElapsedMs,
+            magnetMovingCandidateElapsedMs = magnetOutcome.movingCandidateElapsedMs,
+            magnetAccuracy = magnetAccuracy,
             gpsSpeedMps = gpsSpeedMps,
             gpsAccuracyM = gpsAccuracyM,
             gpsCalibrationStatus = gpsCalibrationStatus,
@@ -868,6 +1117,167 @@ class InferenceEngine {
             ?.let { smooth(it, targetMoving, MAGNET_THRESHOLD_SMOOTHING) }
             ?: targetMoving
         lastMagnetThresholdUpdateAt = now
+    }
+
+    // Runs the magnet channel's one-time usability test and, once passed and
+    // if it is this ride's authority, its own candidate/confirmation state
+    // machine over stableTrainState. See MAGNET_CALIBRATION_MIN_SAMPLES's doc
+    // in the companion object for what the test measures and why it is
+    // open-ended rather than a fixed window.
+    private fun updateMagnetState(
+        magnetJitterSmoothed: Double?,
+        candidateState: String?,
+        authoritative: Boolean,
+        effectiveStopThreshold: Double,
+        effectiveMovingThreshold: Double,
+        now: Long,
+    ): MagnetOutcome {
+        // Anchored on the first tick rather than the first usable sample, so
+        // a phone whose magnetometer never reports at all still reaches the
+        // MAX_WINDOW_MS deadline and settles on "不可用" instead of sitting
+        // in "校准中" for the whole ride.
+        if (magnetFirstSampleAt == null) magnetFirstSampleAt = now
+
+        if (magnetUsable == null) {
+            if (magnetJitterSmoothed != null) {
+                magnetCalibrationSamples.add(magnetJitterSmoothed)
+                if (magnetCalibrationSamples.size >= MAGNET_CALIBRATION_MIN_SAMPLES) {
+                    val sorted = magnetCalibrationSamples.sorted()
+                    val low = percentile(sorted, MAGNET_CALIBRATION_LOW_PERCENTILE)
+                    val high = percentile(sorted, MAGNET_CALIBRATION_HIGH_PERCENTILE)
+                    magnetCalibrationLowJitter = low
+                    magnetCalibrationHighJitter = high
+                    // The channel is only worth trusting if what it has
+                    // actually produced so far reaches both sides of its own
+                    // decision band; a distribution sitting entirely inside
+                    // or entirely below the band can never yield one of the
+                    // two verdicts.
+                    if (low <= effectiveStopThreshold && high >= effectiveMovingThreshold) {
+                        magnetUsable = true
+                        magnetCalibrationSamples.clear()
+                    }
+                }
+            }
+            if (magnetUsable == null) {
+                val elapsed = (now - magnetFirstSampleAt!!).coerceAtLeast(0L)
+                if (elapsed < MAGNET_CALIBRATION_MAX_WINDOW_MS) {
+                    return MagnetOutcome(
+                        calibrationStatus = MAGNET_STATUS_CALIBRATING,
+                        usable = false,
+                        lowJitter = magnetCalibrationLowJitter,
+                        highJitter = magnetCalibrationHighJitter,
+                        stopCandidateElapsedMs = 0L,
+                        movingCandidateElapsedMs = 0L,
+                        reason = null,
+                    )
+                }
+                magnetUsable = false
+                magnetCalibrationSamples.clear()
+            }
+        }
+
+        if (magnetUsable != true) {
+            return MagnetOutcome(
+                calibrationStatus = MAGNET_STATUS_UNUSABLE,
+                usable = false,
+                lowJitter = magnetCalibrationLowJitter,
+                highJitter = magnetCalibrationHighJitter,
+                stopCandidateElapsedMs = 0L,
+                movingCandidateElapsedMs = 0L,
+                reason = null,
+            )
+        }
+
+        if (!authoritative) {
+            // Trustworthy, but something else is deciding this ride (GPS
+            // outranks it, or magnetPrimaryEnabled is off and it is back
+            // to being the mic's assist). Drop any half-built candidate so
+            // it cannot resume from a stale timer if it takes over later.
+            magnetStopCandidateSince = null
+            magnetMovingCandidateSince = null
+            return MagnetOutcome(
+                calibrationStatus = MAGNET_STATUS_USABLE,
+                usable = true,
+                lowJitter = magnetCalibrationLowJitter,
+                highJitter = magnetCalibrationHighJitter,
+                stopCandidateElapsedMs = 0L,
+                movingCandidateElapsedMs = 0L,
+                reason = null,
+            )
+        }
+
+        if (magnetJitterSmoothed == null) {
+            // Momentarily no smoothed reading (sensor gap long enough to
+            // empty the smoothing window). Hold the last confirmed state,
+            // same as the GPS channel does when a fix drops out.
+            magnetStopCandidateSince = null
+            magnetMovingCandidateSince = null
+            return MagnetOutcome(
+                calibrationStatus = MAGNET_STATUS_USABLE,
+                usable = true,
+                lowJitter = magnetCalibrationLowJitter,
+                highJitter = magnetCalibrationHighJitter,
+                stopCandidateElapsedMs = 0L,
+                movingCandidateElapsedMs = 0L,
+                reason = "magnet-signal-lost-hold-state",
+            )
+        }
+
+        var stopElapsed = 0L
+        var movingElapsed = 0L
+        val reason: String
+
+        when (candidateState) {
+            STATE_STOPPED -> {
+                magnetMovingCandidateSince = null
+                if (stableTrainState == STATE_STOPPED) {
+                    magnetStopCandidateSince = null
+                    reason = "magnet-stop-hold"
+                } else {
+                    val since = magnetStopCandidateSince ?: now.also { magnetStopCandidateSince = it }
+                    stopElapsed = (now - since).coerceAtLeast(0L)
+                    if (stopElapsed >= MAGNET_STOP_CONFIRMATION_MS) {
+                        stableTrainState = STATE_STOPPED
+                        magnetStopCandidateSince = null
+                        reason = "magnet-stop-confirmed"
+                    } else {
+                        reason = "magnet-stop-confirming"
+                    }
+                }
+            }
+            STATE_MOVING -> {
+                magnetStopCandidateSince = null
+                if (stableTrainState == STATE_MOVING) {
+                    magnetMovingCandidateSince = null
+                    reason = "magnet-moving-hold"
+                } else {
+                    val since = magnetMovingCandidateSince ?: now.also { magnetMovingCandidateSince = it }
+                    movingElapsed = (now - since).coerceAtLeast(0L)
+                    if (movingElapsed >= MAGNET_MOVING_CONFIRMATION_MS) {
+                        stableTrainState = STATE_MOVING
+                        magnetMovingCandidateSince = null
+                        reason = "magnet-moving-confirmed"
+                    } else {
+                        reason = "magnet-moving-confirming"
+                    }
+                }
+            }
+            else -> {
+                magnetStopCandidateSince = null
+                magnetMovingCandidateSince = null
+                reason = "magnet-ambiguous-hold-state"
+            }
+        }
+
+        return MagnetOutcome(
+            calibrationStatus = MAGNET_STATUS_USABLE,
+            usable = true,
+            lowJitter = magnetCalibrationLowJitter,
+            highJitter = magnetCalibrationHighJitter,
+            stopCandidateElapsedMs = stopElapsed,
+            movingCandidateElapsedMs = movingElapsed,
+            reason = reason,
+        )
     }
 
     // Runs the one-time GPS accuracy calibration test and, once passed, the
