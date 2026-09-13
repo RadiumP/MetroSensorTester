@@ -119,6 +119,19 @@ class MainActivity : Activity() {
         controls.addView(exportButton, weighted())
         root.addView(controls)
 
+        // Ground-truth state labels, back after being dropped in favour of
+        // the broadcast button alone. They are what makes a ride usable for
+        // scoring the engine: unlike "广播N", which is a bare timestamp,
+        // these persist until changed, so every frame of the ride carries a
+        // known answer and accuracy can simply be counted. The six rides
+        // labelled this way are what the fusion constants were swept on.
+        // Press 停站 the moment the train comes to a stand and 运行 the
+        // moment it pulls away.
+        val states = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        states.addView(button("停站") { setMark("停站") }, weighted())
+        states.addView(button("运行") { setMark("运行") }, weighted())
+        root.addView(states)
+
         val labels = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         labels.addView(button("广播") { markBroadcastHeard() }, weighted())
         labels.addView(button("清除标记") { setMark("") }, weighted())

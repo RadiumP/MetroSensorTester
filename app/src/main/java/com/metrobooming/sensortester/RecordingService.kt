@@ -68,6 +68,18 @@ class RecordingService : Service() {
             "magnet_stop_candidate_elapsed_ms", "magnet_moving_candidate_elapsed_ms",
             "magnet_accuracy",
             "magnet_stop_confirmation_ms", "magnet_moving_confirmation_ms",
+            "magnet_dynamic_stop_threshold", "magnet_dynamic_moving_threshold",
+            "magnet_effective_stop_threshold", "magnet_effective_moving_threshold",
+            "magnet_threshold_mode",
+            "pressure_change_rate", "pressure_change_rate_smoothed",
+            "magnet_rank", "mic_rank", "pressure_rank",
+            "fusion_score", "fusion_channel_count",
+            "fusion_stop_candidate_elapsed_ms", "fusion_moving_candidate_elapsed_ms",
+            "fusion_enabled",
+            "battery_percent", "battery_charge_counter_uah", "battery_current_ua",
+            "battery_temperature_c", "battery_charging", "battery_plugged",
+            "battery_session_used_mah", "battery_session_drain_pct_per_hour",
+            "battery_session_elapsed_ms",
             "mic_decision_enabled", "magnet_primary_enabled",
             "moving_confirmation_ms", "moving_candidate_elapsed_ms",
             "app_in_foreground", "screen_on", "wake_lock_held",
@@ -102,6 +114,7 @@ class RecordingService : Service() {
 
     private lateinit var sensors: SensorCollector
     private lateinit var gps: GpsCollector
+    private lateinit var battery: BatteryCollector
     private lateinit var powerManager: PowerManager
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -133,6 +146,7 @@ class RecordingService : Service() {
         super.onCreate()
         sensors = SensorCollector(this)
         gps = GpsCollector(this)
+        battery = BatteryCollector(this)
         powerManager = getSystemService(POWER_SERVICE) as PowerManager
         createNotificationChannel()
         audio = AudioCollector(this)
@@ -188,6 +202,7 @@ class RecordingService : Service() {
             sensors.stop()
             audio.stop()
             gps.stop()
+            battery.stopSession()
             releaseWakeLock()
         }
         foregroundServiceActive = false
@@ -207,6 +222,7 @@ class RecordingService : Service() {
             sensors.stop()
             audio.stop()
             gps.stop()
+            battery.stopSession()
         }
         releaseWakeLock()
         gameLink.stop()
@@ -230,6 +246,7 @@ class RecordingService : Service() {
         sensors.start()
         audio.start()
         gps.start()
+        battery.startSession()
         recording = true
         latestStatus = RecordingStatus(
             recording = true,
@@ -254,6 +271,7 @@ class RecordingService : Service() {
             val sensor = sensors.takeSnapshot()
             val mic = audio.takeSnapshot(now)
             val gpsSnapshot = gps.takeSnapshot(now)
+            val battery = this@RecordingService.battery.takeSnapshot()
             if (lastAudioSource != null && lastAudioSource != mic.audioSource) {
                 // The RMS scale this reading is on may have just changed
                 // (see lastAudioSource doc above) — any history/dynamic
@@ -275,6 +293,7 @@ class RecordingService : Service() {
                 gpsSnapshot.speedMps,
                 gpsSnapshot.accuracyM,
                 sensor.magnetAccuracy,
+                sensor.pressureHpa?.toDouble(),
             )
             val screenOn = powerManager.isInteractive
             val wakeLockHeld = wakeLock?.isHeld == true
@@ -329,6 +348,30 @@ class RecordingService : Service() {
                 inferred.magnetAccuracy,
                 InferenceEngine.MAGNET_STOP_CONFIRMATION_MS,
                 InferenceEngine.MAGNET_MOVING_CONFIRMATION_MS,
+                inferred.magnetDynamicStopThreshold,
+                inferred.magnetDynamicMovingThreshold,
+                inferred.magnetEffectiveStopThreshold,
+                inferred.magnetEffectiveMovingThreshold,
+                inferred.magnetThresholdMode,
+                inferred.pressureChangeRate,
+                inferred.pressureChangeRateSmoothed,
+                inferred.magnetRank,
+                inferred.micRank,
+                inferred.pressureRank,
+                inferred.fusionScore,
+                inferred.fusionChannelCount,
+                inferred.fusionStopCandidateElapsedMs,
+                inferred.fusionMovingCandidateElapsedMs,
+                if (inference.fusionEnabled) 1 else 0,
+                battery.percent,
+                battery.chargeCounterUah,
+                battery.currentNowUa,
+                battery.temperatureC,
+                battery.charging?.let { if (it) 1 else 0 },
+                battery.plugged,
+                battery.sessionUsedMah,
+                battery.sessionDrainPercentPerHour,
+                battery.sessionElapsedMs,
                 if (inference.micDecisionEnabled) 1 else 0,
                 if (inference.magnetPrimaryEnabled) 1 else 0,
                 InferenceEngine.MOVING_CONFIRMATION_MS,

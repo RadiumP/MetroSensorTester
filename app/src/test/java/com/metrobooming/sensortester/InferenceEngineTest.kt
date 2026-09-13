@@ -18,6 +18,7 @@ class InferenceEngineTest {
     private fun legacyFusionEngine() = InferenceEngine(
         micDecisionEnabled = true,
         magnetPrimaryEnabled = false,
+        fusionEnabled = false,
     )
 
     @Test
@@ -559,7 +560,7 @@ class InferenceEngineTest {
         // Reproduces the 2026-09-06 ride, whose smoothed jitter never once
         // crossed MAGNET_MOVING_JITTER_THRESHOLD: the channel could only ever
         // have emitted "停站", so it must be given up on rather than trusted.
-        val engine = InferenceEngine()
+        val engine = magnetPrimaryEngine()
         val flip = BooleanArray(1)
 
         val (midway, midwayNow) = feedMagnet(engine, 0.5, 400, 0L, 0.0020, flip)
@@ -578,7 +579,7 @@ class InferenceEngineTest {
 
     @Test
     fun magnetBecomesPrimaryOnceItsJitterStraddlesItsOwnBand() {
-        val engine = InferenceEngine()
+        val engine = magnetPrimaryEngine()
         val flip = BooleanArray(1)
         // Deep in mic "stopped" territory for the whole test, so any state
         // change below can only have come from the magnet channel.
@@ -614,7 +615,7 @@ class InferenceEngineTest {
 
     @Test
     fun magnetPrimaryLeavesTheStateAloneWhileItsSignalIsMissing() {
-        val engine = InferenceEngine()
+        val engine = magnetPrimaryEngine()
         val flip = BooleanArray(1)
         val (usable, now) = feedMagnet(engine, 3.0, 40, 0L, 0.0020, flip)
         // A magnetometer that only ever reads high jitter never shows the
@@ -636,5 +637,168 @@ class InferenceEngineTest {
         assertNull(result.magnetJitterSmoothed)
         assertNull(result.magnetCandidateState)
         assertEquals("校准中", result.trainState)
+    }
+
+    @Test
+    fun pressureChannelIsComputedAndLoggedWithoutAffectingTheDecision() {
+        val engine = magnetPrimaryEngine()
+        var now = 0L
+        var result: InferenceResult? = null
+
+        // Alternating the reading by 0.02 hPa makes every tick's delta exactly
+        // 0.02, so the windowed median settles there once the window fills.
+        var high = false
+        repeat(20) {
+            high = !high
+            result = engine.update(
+                micRms = 0.0020, micValid = true, micPeak = 0.006,
+                accelRms = 0.0, gyroDegreesRms = 0.0, magnetMagnitude = null,
+                now = now, pressureHpa = if (high) 1013.02 else 1013.00,
+            )
+            now += 250L
+        }
+        assertEquals(0.02, result!!.pressureChangeRate!!, 1e-9)
+        assertEquals(0.02, result!!.pressureChangeRateSmoothed!!, 1e-9)
+
+        // A steady barometer reads a change rate of zero rather than null:
+        // "not moving the air" is a real measurement, unlike "no barometer".
+        repeat(20) {
+            result = engine.update(
+                micRms = 0.0020, micValid = true, micPeak = 0.006,
+                accelRms = 0.0, gyroDegreesRms = 0.0, magnetMagnitude = null,
+                now = now, pressureHpa = 1013.00,
+            )
+            now += 250L
+        }
+        assertEquals(0.0, result!!.pressureChangeRateSmoothed!!, 1e-9)
+
+        // No barometer at all leaves both fields null, and either way the
+        // pressure channel must not have moved the state: with no magnetometer
+        // samples the magnet channel can never pass its own test, and the mic
+        // channel is switched off in this configuration, so nothing is left
+        // that may decide.
+        repeat(8) {
+            result = engine.update(
+                micRms = 0.0020, micValid = true, micPeak = 0.006,
+                accelRms = 0.0, gyroDegreesRms = 0.0, magnetMagnitude = null,
+                now = now, pressureHpa = null,
+            )
+            now += 250L
+        }
+        assertNull(result!!.pressureChangeRate)
+        assertEquals("校准中", result!!.trainState)
+    }
+
+    @Test
+    fun magnetThresholdsAreReportedForCsvInspection() {
+        val engine = magnetPrimaryEngine()
+        val result = engine.update(
+            micRms = 0.0020, micValid = true, micPeak = 0.006,
+            accelRms = 0.0, gyroDegreesRms = 0.0, magnetMagnitude = 30.0, now = 0L,
+        )
+        // Nothing has been learned yet, so the channel reports the fixed
+        // fallbacks and says so.
+        assertNull(result.magnetDynamicStopThreshold)
+        assertNull(result.magnetDynamicMovingThreshold)
+        assertEquals(InferenceEngine.MAGNET_STOP_JITTER_THRESHOLD, result.magnetEffectiveStopThreshold, 1e-9)
+        assertEquals(InferenceEngine.MAGNET_MOVING_JITTER_THRESHOLD, result.magnetEffectiveMovingThreshold, 1e-9)
+        assertEquals("固定", result.magnetThresholdMode)
+    }
+
+    // The legacy single-channel engines are no longer the default, so the
+    // tests covering them ask for their own configuration explicitly.
+    private fun magnetPrimaryEngine() = InferenceEngine(
+        micDecisionEnabled = false,
+        magnetPrimaryEnabled = true,
+        fusionEnabled = false,
+    )
+
+    @Test
+    fun fusionNeedsBothPrimaryChannelsBeforeItWillDecide() {
+        val engine = InferenceEngine()
+        var result: InferenceResult? = null
+        var now = 0L
+        // Magnet only: the barometer never reports, so the fusion falls back
+        // to whatever it can get and, with a single channel, still has to
+        // fill its rank window before it says anything at all.
+        var flip = false
+        repeat(10) {
+            flip = !flip
+            result = engine.update(
+                micRms = 0.0, micValid = false, micPeak = 0.0,
+                accelRms = 0.0, gyroDegreesRms = 0.0,
+                magnetMagnitude = if (flip) 3.0 else 0.0, now = now,
+            )
+            now += 250L
+        }
+        assertNull(result!!.fusionScore)
+        assertEquals(0, result!!.fusionChannelCount)
+        assertEquals("校准中", result!!.trainState)
+    }
+
+    @Test
+    fun fusionRanksAreScaleFreeAcrossWildlyDifferentChannelMagnitudes() {
+        // The whole point of ranking instead of thresholding: two rides whose
+        // raw levels differ by orders of magnitude must produce the same
+        // decision, because only the position within recent history counts.
+        fun ride(scale: Double): InferenceResult {
+            val engine = InferenceEngine()
+            var now = 0L
+            var result: InferenceResult? = null
+            var flip = false
+            // A long stretch of high readings, then a sustained quiet spell.
+            repeat(400) {
+                flip = !flip
+                result = engine.update(
+                    micRms = 0.0020, micValid = true, micPeak = 0.006,
+                    accelRms = 0.0, gyroDegreesRms = 0.0,
+                    magnetMagnitude = if (flip) 4.0 * scale else 0.0,
+                    now = now, pressureHpa = 1013.0 + (if (flip) 0.04 * scale else 0.0),
+                )
+                now += 250L
+            }
+            repeat(120) {
+                result = engine.update(
+                    micRms = 0.0020, micValid = true, micPeak = 0.006,
+                    accelRms = 0.0, gyroDegreesRms = 0.0,
+                    magnetMagnitude = 0.0, now = now, pressureHpa = 1013.0,
+                )
+                now += 250L
+            }
+            return result!!
+        }
+
+        val small = ride(1.0)
+        val large = ride(1000.0)
+        assertEquals("停站", small.trainState)
+        assertEquals("停站", large.trainState)
+        assertEquals(2, small.fusionChannelCount)
+        assertEquals(2, large.fusionChannelCount)
+        // Same verdict, and the same score, despite a 1000x difference in the
+        // underlying readings.
+        assertEquals(small.fusionScore!!, large.fusionScore!!, 1e-9)
+    }
+
+    @Test
+    fun micRankIsStillLoggedEvenThoughItIsNotInTheAverage() {
+        val engine = InferenceEngine()
+        var now = 0L
+        var result: InferenceResult? = null
+        var flip = false
+        repeat(200) {
+            flip = !flip
+            result = engine.update(
+                micRms = if (flip) 0.0030 else 0.0010, micValid = true, micPeak = 0.009,
+                accelRms = 0.0, gyroDegreesRms = 0.0,
+                magnetMagnitude = if (flip) 4.0 else 0.0,
+                now = now, pressureHpa = 1013.0 + (if (flip) 0.04 else 0.0),
+            )
+            now += 250L
+        }
+        assertNotNull(result!!.micRank)
+        // Two primaries are reporting, so the average is over those two only.
+        assertEquals(2, result!!.fusionChannelCount)
+        val expected = (result!!.magnetRank!! + result!!.pressureRank!!) / 2.0
+        assertEquals(expected, result!!.fusionScore!!, 1e-9)
     }
 }

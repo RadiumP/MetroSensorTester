@@ -103,6 +103,52 @@ data class InferenceResult(
     // so it predicts nothing about whether the jitter signal actually
     // separates the two train states.
     val magnetAccuracy: Int?,
+    // Which jitter thresholds the magnet channel actually used this tick.
+    // Previously none of this reached the CSV, which made the 2026-09-12 logs
+    // impossible to interpret: there was no way to tell whether a ride had
+    // been running on the fixed fallbacks or on the learned per-state ones.
+    val magnetDynamicStopThreshold: Double?,
+    val magnetDynamicMovingThreshold: Double?,
+    val magnetEffectiveStopThreshold: Double,
+    val magnetEffectiveMovingThreshold: Double,
+    val magnetThresholdMode: String,
+    // Barometer channel, logged only: this does NOT feed the train-state
+    // decision yet. Tick-to-tick change in cabin air pressure, and the
+    // windowed median of it. A train running through a tunnel acts as a
+    // piston and stirs the air, so the pressure reading jitters while moving
+    // and settles while stopped. Offline check against the two 2026-09-12
+    // rides (the only ones with mark-derived ground truth so far) put this
+    // ahead of both existing channels: stopped-vs-moving medians separated
+    // 2.4x and 7.2x, against 1.5x/2.1x for magnet jitter and 1.5x/1.8x for
+    // mic RMS, and a single fixed threshold scored 84.5%/87.2% where magnet
+    // scored 75.4%/79.5%. It was also the only channel that held up on the
+    // ride whose magnetometer was swamped by a power bank, which is the
+    // point of interest: its failure modes do not overlap with the other
+    // two. Being logged first rather than wired in because its absolute
+    // scale drifts between rides just like the other channels' does (the
+    // 2026-09-11 ride sat around 0.0175 while stopped, the 2026-09-12 one
+    // around 0.0038), and two ground-truth rides is far too thin to pick a
+    // threshold from.
+    val pressureChangeRate: Double?,
+    val pressureChangeRateSmoothed: Double?,
+    // Three-channel fusion (2026-09-12). Each channel's raw scale is useless
+    // across rides (the same phone read a stopped-state magnet jitter of 0.71
+    // on one ride and 2.14 on another), so no channel is thresholded on its
+    // own value any more. Instead each is converted to its percentile rank
+    // inside a trailing FUSION_RANK_WINDOW_MS window, which asks only "is
+    // this low or high compared with the last minute" and is therefore
+    // immune to both between-ride and within-ride scale drift. Null when
+    // that channel has no reading, or when its window has not filled to
+    // FUSION_RANK_MIN_SAMPLES yet.
+    val magnetRank: Double?,
+    val micRank: Double?,
+    val pressureRank: Double?,
+    // Mean of whichever ranks above are available, and how many that was.
+    // This is the number the decision is actually made on.
+    val fusionScore: Double?,
+    val fusionChannelCount: Int,
+    val fusionStopCandidateElapsedMs: Long,
+    val fusionMovingCandidateElapsedMs: Long,
     // Echoes of this tick's GPS input, for CSV inspection/comparison. Null
     // whenever no fix was available this tick (no permission, no provider,
     // underground, or the last fix went stale — see GpsCollector).
@@ -128,6 +174,7 @@ class InferenceEngine(
     // production callers use the defaults, which are the field-test setting.
     val micDecisionEnabled: Boolean = MIC_DECISION_ENABLED_DEFAULT,
     val magnetPrimaryEnabled: Boolean = MAGNET_PRIMARY_ENABLED_DEFAULT,
+    val fusionEnabled: Boolean = FUSION_ENABLED_DEFAULT,
 ) {
     companion object {
         const val MIC_NONZERO_FLOOR = 0.000001
@@ -274,6 +321,75 @@ class InferenceEngine(
         const val MAGNET_STATUS_USABLE = "可用"
         const val MAGNET_STATUS_UNUSABLE = "不可用"
 
+        // Barometer channel smoothing. Deliberately the same window and
+        // minimum-sample count as the magnet channel above, so the CSV column
+        // can be compared against magnet_jitter_smoothed directly and the
+        // offline replays that picked these numbers stay reproducible.
+        // The barometer reports more slowly than the 250ms tick on some
+        // devices, so consecutive ticks often read an identical value and the
+        // per-tick delta is then legitimately 0; the windowed median absorbs
+        // that.
+        const val PRESSURE_SMOOTHING_WINDOW_MS = 4_000L
+        const val PRESSURE_SMOOTHING_MIN_SAMPLES = 4
+
+        // Mic is smoothed far less than the other two channels: its raw RMS
+        // is already a windowed average inside AudioCollector, so it only
+        // needs enough median filtering to drop single-tick spikes.
+        const val MIC_SMOOTHING_WINDOW_MS = 1_000L
+
+        // Three-channel fusion. Every one of these numbers came out of a
+        // leave-one-out sweep over the six mark-labelled rides (2026-08-17
+        // through 2026-09-12): each fold picked its hyper-parameters on the
+        // other five rides and was scored on the held-out one. All six folds
+        // independently converged on exactly this combination, which is the
+        // main reason to believe it is a real setting rather than a fit to
+        // the sample. Held-out accuracy averaged 91.9% with a worst ride of
+        // 83.2%, against 88.2%/73.7% for the best single channel; on the two
+        // rides that had actually been failing in the field it went from a
+        // measured 66.4% and 79.5% to 83.5% and 83.2%.
+        //
+        // Note the rank normalisation and the fusion only work as a pair.
+        // Rank-normalising a single channel is WORSE than thresholding its
+        // raw value (magnet dropped from 88.2% to 78.7%), because the
+        // normalisation adds noise of its own. What it buys is that the three
+        // channels come out on one common scale, and averaging them then
+        // cancels that noise and more. Splitting the pair in either direction
+        // loses the gain.
+        const val FUSION_RANK_WINDOW_MS = 90_000L
+        const val FUSION_RANK_MIN_SAMPLES = 40
+        const val FUSION_STOP_SCORE = 0.30
+        const val FUSION_MOVING_SCORE = 0.65
+        const val FUSION_STOP_CONFIRMATION_MS = 5_000L
+        const val FUSION_MOVING_CONFIRMATION_MS = 3_000L
+
+        // Switched on by default (2026-09-12), replacing the magnet-primary
+        // field-test configuration below it. Turning this off falls back to
+        // whatever MIC_DECISION_ENABLED_DEFAULT / MAGNET_PRIMARY_ENABLED_DEFAULT
+        // select, so the previous behaviour stays reachable for comparison.
+        // GPS still outranks everything when its own calibration passes.
+        const val FUSION_ENABLED_DEFAULT = true
+
+        // Magnet and barometer are the fusion's channels; mic is deliberately
+        // NOT one of them, and only steps in when one of those two has no
+        // reading at all (a phone with no barometer, say). That is not the
+        // obvious choice, so: the first sweep, run against a reference
+        // implementation that fed the mic channel its raw RMS, did favour all
+        // three. Re-running the same sweep against a reference made bit-exact
+        // with this file, mic included, flipped the answer, because the real
+        // engine drops mic samples that fail its validity check and the
+        // resulting gappy channel drags the average around. Held-out accuracy
+        // over the six labelled rides: magnet+barometer 92.7% mean with a
+        // worst ride of 85.2%, against 89.7%/75.9% for all three, 87.9%/78.2%
+        // for magnet+mic and 86.6%/65.6% for mic+barometer. Five of the six
+        // folds also agreed on the constants above for this pairing, where
+        // the three-channel folds could not agree, which is the second reason
+        // to prefer it.
+        //
+        // Worth knowing when reading a CSV: mic_rank is still computed and
+        // logged every tick even though it is normally not in the average,
+        // so a later sweep can revisit this without another field test.
+        val FUSION_PRIMARY_CHANNELS = setOf("magnet", "pressure")
+
         // Defaults for the two field-test switches (2026-09-10): with the
         // mic channel off, a ride isolates what the magnet channel can do on
         // its own. Both flipped back (mic true / magnet false) restores the
@@ -362,6 +478,53 @@ class InferenceEngine(
     private data class RecentMicSample(val timestampMs: Long, val rms: Double)
     private data class MagnetPoint(val timestampMs: Long, val jitterSmoothed: Double, val trainState: String)
     private data class RecentMagnetSample(val timestampMs: Long, val jitter: Double)
+    private data class RecentPressureSample(val timestampMs: Long, val change: Double)
+    private data class RecentMicSmoothingSample(val timestampMs: Long, val rms: Double)
+
+    /**
+     * Trailing window that reports where a new value sits inside its own
+     * recent history, as a 0..1 percentile. Ties are averaged and the new
+     * value counts itself, matching the reference implementation the fusion
+     * constants were swept with, so the Kotlin engine and the offline replay
+     * of the same ride agree.
+     */
+    private class RankWindow(private val windowMs: Long, private val minSamples: Int) {
+        private val timestamps = ArrayDeque<Long>()
+        private val values = ArrayDeque<Double>()
+
+        fun clear() {
+            timestamps.clear()
+            values.clear()
+        }
+
+        fun pushAndRank(value: Double, now: Long): Double? {
+            while (timestamps.firstOrNull()?.let { it < now - windowMs } == true) {
+                timestamps.removeFirst()
+                values.removeFirst()
+            }
+            timestamps.addLast(now)
+            values.addLast(value)
+            if (values.size < minSamples) return null
+            var below = 0
+            var equal = 0
+            for (v in values) {
+                if (v < value) below++ else if (v == value) equal++
+            }
+            return (below + (equal + 1) / 2.0) / values.size
+        }
+    }
+
+    private data class FusionOutcome(
+        val magnetRank: Double?,
+        val micRank: Double?,
+        val pressureRank: Double?,
+        val score: Double?,
+        val channelCount: Int,
+        val stopCandidateElapsedMs: Long,
+        val movingCandidateElapsedMs: Long,
+        // Non-null only when the fusion actually owns the decision this tick.
+        val reason: String?,
+    )
     private data class MagnetCandidateVote(val timestampMs: Long, val state: String)
     private data class MagnetOutcome(
         val calibrationStatus: String,
@@ -410,6 +573,14 @@ class InferenceEngine(
     private var dynamicMagnetStopThreshold: Double? = null
     private var dynamicMagnetMovingThreshold: Double? = null
     private var lastMagnetThresholdUpdateAt = 0L
+    private var lastPressureHpa: Double? = null
+    private val recentPressureChangeSamples = ArrayDeque<RecentPressureSample>()
+    private val recentMicSmoothingSamples = ArrayDeque<RecentMicSmoothingSample>()
+    private val magnetRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
+    private val micRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
+    private val pressureRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
+    private var fusionStopCandidateSince: Long? = null
+    private var fusionMovingCandidateSince: Long? = null
     private val magnetCandidateVotes = ArrayDeque<MagnetCandidateVote>()
     // Smoothed-jitter samples feeding the one-time magnet usability test.
     // Bounded by MAGNET_CALIBRATION_MAX_WINDOW_MS worth of ticks and dropped
@@ -450,6 +621,14 @@ class InferenceEngine(
         dynamicMagnetMovingThreshold = null
         lastMagnetThresholdUpdateAt = 0L
         magnetCandidateVotes.clear()
+        lastPressureHpa = null
+        recentPressureChangeSamples.clear()
+        recentMicSmoothingSamples.clear()
+        magnetRankWindow.clear()
+        micRankWindow.clear()
+        pressureRankWindow.clear()
+        fusionStopCandidateSince = null
+        fusionMovingCandidateSince = null
         magnetCalibrationSamples.clear()
         magnetFirstSampleAt = null
         magnetUsable = null
@@ -475,6 +654,7 @@ class InferenceEngine(
         gpsSpeedMps: Double? = null,
         gpsAccuracyM: Double? = null,
         magnetAccuracy: Int? = null,
+        pressureHpa: Double? = null,
     ): InferenceResult {
         val magnetMagnitudeJitter = if (magnetMagnitude != null && lastMagnetMagnitude != null) {
             kotlin.math.abs(magnetMagnitude - lastMagnetMagnitude!!)
@@ -514,6 +694,31 @@ class InferenceEngine(
             maybeUpdateDynamicMagnetThresholds(now)
         }
 
+        // Barometer channel: same shape as the magnet jitter above, but its
+        // output is only carried through to the CSV (see pressureChangeRate's
+        // doc on InferenceResult); nothing below branches on it.
+        val pressureChangeRate = if (pressureHpa != null && lastPressureHpa != null) {
+            kotlin.math.abs(pressureHpa - lastPressureHpa!!)
+        } else {
+            null
+        }
+        if (pressureHpa != null) lastPressureHpa = pressureHpa
+        while (
+            recentPressureChangeSamples.firstOrNull()?.timestampMs
+                ?.let { it < now - PRESSURE_SMOOTHING_WINDOW_MS } == true
+        ) {
+            recentPressureChangeSamples.removeFirst()
+        }
+        if (pressureChangeRate != null) {
+            recentPressureChangeSamples.addLast(RecentPressureSample(now, pressureChangeRate))
+        }
+        val pressureChangeRateSmoothed =
+            if (recentPressureChangeSamples.size >= PRESSURE_SMOOTHING_MIN_SAMPLES) {
+                percentile(recentPressureChangeSamples.map { it.change }.sorted(), 0.5)
+            } else {
+                null
+            }
+
         val effectiveMagnetStopThreshold = dynamicMagnetStopThreshold ?: MAGNET_STOP_JITTER_THRESHOLD
         val effectiveMagnetMovingThreshold = dynamicMagnetMovingThreshold ?: MAGNET_MOVING_JITTER_THRESHOLD
         val magnetCandidateState = when {
@@ -524,6 +729,23 @@ class InferenceEngine(
         }
 
         val micUsable = micValid && micRms >= MIC_NONZERO_FLOOR
+        // Short median of the mic level, used only as the fusion channel's
+        // input; the mic-primary path below keeps reading the raw RMS so its
+        // long-standing threshold numbers stay meaningful.
+        while (
+            recentMicSmoothingSamples.firstOrNull()?.timestampMs
+                ?.let { it < now - MIC_SMOOTHING_WINDOW_MS } == true
+        ) {
+            recentMicSmoothingSamples.removeFirst()
+        }
+        if (micUsable) {
+            recentMicSmoothingSamples.addLast(RecentMicSmoothingSample(now, micRms))
+        }
+        val micSmoothed = if (recentMicSmoothingSamples.isEmpty()) {
+            null
+        } else {
+            percentile(recentMicSmoothingSamples.map { it.rms }.sorted(), 0.5)
+        }
         if (micUsable) {
             purgeOldMicSamples(now)
             maybeUpdateDynamicThresholds(now)
@@ -581,10 +803,17 @@ class InferenceEngine(
         // its verdict) even on a ride where GPS took over. GPS outranks it
         // when both are usable, so it only ever claims authority once GPS
         // has not.
+        val fusionOutcome = updateFusionState(
+            magnetJitterSmoothed = magnetJitterSmoothed,
+            micSmoothed = micSmoothed,
+            pressureChangeRateSmoothed = pressureChangeRateSmoothed,
+            authoritative = fusionEnabled && !gpsOutcome.usable,
+            now = now,
+        )
         val magnetOutcome = updateMagnetState(
             magnetJitterSmoothed = magnetJitterSmoothed,
             candidateState = magnetCandidateState,
-            authoritative = magnetPrimaryEnabled && !gpsOutcome.usable,
+            authoritative = magnetPrimaryEnabled && !gpsOutcome.usable && !fusionEnabled,
             effectiveStopThreshold = effectiveMagnetStopThreshold,
             effectiveMovingThreshold = effectiveMagnetMovingThreshold,
             now = now,
@@ -628,6 +857,11 @@ class InferenceEngine(
                 magnetAssistNote = "none",
                 magnetOutcome = magnetOutcome,
                 magnetAccuracy = magnetAccuracy,
+                magnetEffectiveStopThreshold = effectiveMagnetStopThreshold,
+                magnetEffectiveMovingThreshold = effectiveMagnetMovingThreshold,
+                pressureChangeRate = pressureChangeRate,
+                pressureChangeRateSmoothed = pressureChangeRateSmoothed,
+                fusionOutcome = fusionOutcome,
                 gpsSpeedMps = gpsSpeedMps,
                 gpsAccuracyM = gpsAccuracyM,
                 gpsCalibrationStatus = gpsOutcome.calibrationStatus,
@@ -635,6 +869,59 @@ class InferenceEngine(
                 gpsStopCandidateElapsedMs = gpsOutcome.stopCandidateElapsedMs,
                 gpsMovingCandidateElapsedMs = gpsOutcome.movingCandidateElapsedMs,
                 reason = gpsOutcome.reason ?: "gps-hold-state",
+            )
+        }
+
+        if (fusionOutcome.reason != null) {
+            // Fusion owns the decision for this ride; it has already applied
+            // this tick's verdict to stableTrainState. The single-channel
+            // paths below keep being computed and logged for comparison, and
+            // mic history keeps accumulating, but none of them may move the
+            // state.
+            stopCandidateSince = null
+            movingCandidateSince = null
+            if (
+                micUsable && micRms >= MIC_NONZERO_FLOOR &&
+                (stableTrainState == STATE_MOVING || stableTrainState == STATE_STOPPED)
+            ) {
+                micHistory.addLast(MicPoint(now, micRms, stableTrainState))
+            }
+            return result(
+                micRms = micRms,
+                playerActive = playerActive,
+                playerState = playerState,
+                rawTrainState = stableTrainState,
+                effectiveStopThreshold = effectiveStopThreshold,
+                effectiveMovingThreshold = effectiveMovingThreshold,
+                thresholdMode = thresholdMode,
+                micLevelRatio = micLevelRatio,
+                micAboveMovingThreshold = micAboveMovingThreshold,
+                micBelowStopThreshold = micBelowStopThreshold,
+                stopCandidateElapsedMs = 0L,
+                movingCandidateElapsedMs = 0L,
+                micCrestFactor = micCrestFactor,
+                micChimeCandidate = micChimeCandidate,
+                micBaselineRms = micBaselineRms,
+                micRmsBumpRatio = micRmsBumpRatio,
+                micRmsBumpCandidate = micRmsBumpCandidate,
+                magnetMagnitudeJitter = magnetMagnitudeJitter,
+                magnetJitterSmoothed = magnetJitterSmoothed,
+                magnetCandidateState = magnetCandidateState,
+                magnetAssistNote = "none",
+                magnetOutcome = magnetOutcome,
+                magnetAccuracy = magnetAccuracy,
+                magnetEffectiveStopThreshold = effectiveMagnetStopThreshold,
+                magnetEffectiveMovingThreshold = effectiveMagnetMovingThreshold,
+                pressureChangeRate = pressureChangeRate,
+                pressureChangeRateSmoothed = pressureChangeRateSmoothed,
+                fusionOutcome = fusionOutcome,
+                gpsSpeedMps = gpsSpeedMps,
+                gpsAccuracyM = gpsAccuracyM,
+                gpsCalibrationStatus = gpsOutcome.calibrationStatus,
+                gpsCandidateState = gpsOutcome.candidateState,
+                gpsStopCandidateElapsedMs = 0L,
+                gpsMovingCandidateElapsedMs = 0L,
+                reason = fusionOutcome.reason,
             )
         }
 
@@ -675,6 +962,11 @@ class InferenceEngine(
                 magnetAssistNote = "primary",
                 magnetOutcome = magnetOutcome,
                 magnetAccuracy = magnetAccuracy,
+                magnetEffectiveStopThreshold = effectiveMagnetStopThreshold,
+                magnetEffectiveMovingThreshold = effectiveMagnetMovingThreshold,
+                pressureChangeRate = pressureChangeRate,
+                pressureChangeRateSmoothed = pressureChangeRateSmoothed,
+                fusionOutcome = fusionOutcome,
                 gpsSpeedMps = gpsSpeedMps,
                 gpsAccuracyM = gpsAccuracyM,
                 gpsCalibrationStatus = gpsOutcome.calibrationStatus,
@@ -721,6 +1013,11 @@ class InferenceEngine(
                 magnetAssistNote = "none",
                 magnetOutcome = magnetOutcome,
                 magnetAccuracy = magnetAccuracy,
+                magnetEffectiveStopThreshold = effectiveMagnetStopThreshold,
+                magnetEffectiveMovingThreshold = effectiveMagnetMovingThreshold,
+                pressureChangeRate = pressureChangeRate,
+                pressureChangeRateSmoothed = pressureChangeRateSmoothed,
+                fusionOutcome = fusionOutcome,
                 gpsSpeedMps = gpsSpeedMps,
                 gpsAccuracyM = gpsAccuracyM,
                 gpsCalibrationStatus = gpsOutcome.calibrationStatus,
@@ -762,6 +1059,11 @@ class InferenceEngine(
                 magnetAssistNote = "none",
                 magnetOutcome = magnetOutcome,
                 magnetAccuracy = magnetAccuracy,
+                magnetEffectiveStopThreshold = effectiveMagnetStopThreshold,
+                magnetEffectiveMovingThreshold = effectiveMagnetMovingThreshold,
+                pressureChangeRate = pressureChangeRate,
+                pressureChangeRateSmoothed = pressureChangeRateSmoothed,
+                fusionOutcome = fusionOutcome,
                 gpsSpeedMps = gpsSpeedMps,
                 gpsAccuracyM = gpsAccuracyM,
                 gpsCalibrationStatus = gpsOutcome.calibrationStatus,
@@ -925,6 +1227,11 @@ class InferenceEngine(
             magnetAssistNote = magnetAssistNote,
             magnetOutcome = magnetOutcome,
             magnetAccuracy = magnetAccuracy,
+            magnetEffectiveStopThreshold = effectiveMagnetStopThreshold,
+            magnetEffectiveMovingThreshold = effectiveMagnetMovingThreshold,
+            pressureChangeRate = pressureChangeRate,
+            pressureChangeRateSmoothed = pressureChangeRateSmoothed,
+            fusionOutcome = fusionOutcome,
             gpsSpeedMps = gpsSpeedMps,
             gpsAccuracyM = gpsAccuracyM,
             gpsCalibrationStatus = gpsOutcome.calibrationStatus,
@@ -959,6 +1266,11 @@ class InferenceEngine(
         magnetAssistNote: String,
         magnetOutcome: MagnetOutcome,
         magnetAccuracy: Int?,
+        magnetEffectiveStopThreshold: Double,
+        magnetEffectiveMovingThreshold: Double,
+        pressureChangeRate: Double?,
+        pressureChangeRateSmoothed: Double?,
+        fusionOutcome: FusionOutcome,
         gpsSpeedMps: Double?,
         gpsAccuracyM: Double?,
         gpsCalibrationStatus: String,
@@ -1011,6 +1323,26 @@ class InferenceEngine(
             magnetStopCandidateElapsedMs = magnetOutcome.stopCandidateElapsedMs,
             magnetMovingCandidateElapsedMs = magnetOutcome.movingCandidateElapsedMs,
             magnetAccuracy = magnetAccuracy,
+            magnetDynamicStopThreshold = dynamicMagnetStopThreshold,
+            magnetDynamicMovingThreshold = dynamicMagnetMovingThreshold,
+            magnetEffectiveStopThreshold = magnetEffectiveStopThreshold,
+            magnetEffectiveMovingThreshold = magnetEffectiveMovingThreshold,
+            magnetThresholdMode = if (
+                dynamicMagnetStopThreshold != null && dynamicMagnetMovingThreshold != null
+            ) {
+                "动态"
+            } else {
+                "固定"
+            },
+            pressureChangeRate = pressureChangeRate,
+            pressureChangeRateSmoothed = pressureChangeRateSmoothed,
+            magnetRank = fusionOutcome.magnetRank,
+            micRank = fusionOutcome.micRank,
+            pressureRank = fusionOutcome.pressureRank,
+            fusionScore = fusionOutcome.score,
+            fusionChannelCount = fusionOutcome.channelCount,
+            fusionStopCandidateElapsedMs = fusionOutcome.stopCandidateElapsedMs,
+            fusionMovingCandidateElapsedMs = fusionOutcome.movingCandidateElapsedMs,
             gpsSpeedMps = gpsSpeedMps,
             gpsAccuracyM = gpsAccuracyM,
             gpsCalibrationStatus = gpsCalibrationStatus,
@@ -1117,6 +1449,113 @@ class InferenceEngine(
             ?.let { smooth(it, targetMoving, MAGNET_THRESHOLD_SMOOTHING) }
             ?: targetMoving
         lastMagnetThresholdUpdateAt = now
+    }
+
+    // Converts each channel to a percentile rank inside its own trailing
+    // window, averages whichever are available, and runs the confirmation
+    // state machine on that average. See FUSION_RANK_WINDOW_MS's doc for why
+    // the ranks rather than the raw values, and where the constants came
+    // from. A low score means "all three channels are quiet relative to
+    // their own recent history", which is what a stopped train looks like
+    // regardless of how loud or magnetically noisy this particular ride is.
+    private fun updateFusionState(
+        magnetJitterSmoothed: Double?,
+        micSmoothed: Double?,
+        pressureChangeRateSmoothed: Double?,
+        authoritative: Boolean,
+        now: Long,
+    ): FusionOutcome {
+        val magnetRank = magnetJitterSmoothed?.let { magnetRankWindow.pushAndRank(it, now) }
+        val micRank = micSmoothed?.let { micRankWindow.pushAndRank(it, now) }
+        val pressureRank = pressureChangeRateSmoothed?.let { pressureRankWindow.pushAndRank(it, now) }
+
+        // Normal case: the two primary channels. Mic joins only to keep the
+        // fusion alive when fewer than two primaries are reporting.
+        val primary = listOfNotNull(
+            magnetRank.takeIf { "magnet" in FUSION_PRIMARY_CHANNELS },
+            pressureRank.takeIf { "pressure" in FUSION_PRIMARY_CHANNELS },
+        )
+        val ranks = if (primary.size >= 2) {
+            primary
+        } else {
+            listOfNotNull(magnetRank, micRank, pressureRank)
+        }
+        val score = if (ranks.isEmpty()) null else ranks.sum() / ranks.size
+
+        if (!authoritative || score == null) {
+            // Either something else owns the decision, or not enough history
+            // has accumulated yet. Drop any half-built candidate so a later
+            // handover cannot resume from a stale timer.
+            fusionStopCandidateSince = null
+            fusionMovingCandidateSince = null
+            return FusionOutcome(
+                magnetRank = magnetRank,
+                micRank = micRank,
+                pressureRank = pressureRank,
+                score = score,
+                channelCount = ranks.size,
+                stopCandidateElapsedMs = 0L,
+                movingCandidateElapsedMs = 0L,
+                reason = if (authoritative) "fusion-warming-up-hold-state" else null,
+            )
+        }
+
+        var stopElapsed = 0L
+        var movingElapsed = 0L
+        val reason: String
+
+        when {
+            score <= FUSION_STOP_SCORE -> {
+                fusionMovingCandidateSince = null
+                if (stableTrainState == STATE_STOPPED) {
+                    fusionStopCandidateSince = null
+                    reason = "fusion-stop-hold"
+                } else {
+                    val since = fusionStopCandidateSince ?: now.also { fusionStopCandidateSince = it }
+                    stopElapsed = (now - since).coerceAtLeast(0L)
+                    if (stopElapsed >= FUSION_STOP_CONFIRMATION_MS) {
+                        stableTrainState = STATE_STOPPED
+                        fusionStopCandidateSince = null
+                        reason = "fusion-stop-confirmed"
+                    } else {
+                        reason = "fusion-stop-confirming"
+                    }
+                }
+            }
+            score >= FUSION_MOVING_SCORE -> {
+                fusionStopCandidateSince = null
+                if (stableTrainState == STATE_MOVING) {
+                    fusionMovingCandidateSince = null
+                    reason = "fusion-moving-hold"
+                } else {
+                    val since = fusionMovingCandidateSince ?: now.also { fusionMovingCandidateSince = it }
+                    movingElapsed = (now - since).coerceAtLeast(0L)
+                    if (movingElapsed >= FUSION_MOVING_CONFIRMATION_MS) {
+                        stableTrainState = STATE_MOVING
+                        fusionMovingCandidateSince = null
+                        reason = "fusion-moving-confirmed"
+                    } else {
+                        reason = "fusion-moving-confirming"
+                    }
+                }
+            }
+            else -> {
+                fusionStopCandidateSince = null
+                fusionMovingCandidateSince = null
+                reason = "fusion-ambiguous-hold-state"
+            }
+        }
+
+        return FusionOutcome(
+            magnetRank = magnetRank,
+            micRank = micRank,
+            pressureRank = pressureRank,
+            score = score,
+            channelCount = ranks.size,
+            stopCandidateElapsedMs = stopElapsed,
+            movingCandidateElapsedMs = movingElapsed,
+            reason = reason,
+        )
     }
 
     // Runs the magnet channel's one-time usability test and, once passed and
