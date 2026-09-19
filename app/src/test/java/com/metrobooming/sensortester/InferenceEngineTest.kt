@@ -801,4 +801,95 @@ class InferenceEngineTest {
         val expected = (result!!.magnetRank!! + result!!.pressureRank!!) / 2.0
         assertEquals(expected, result!!.fusionScore!!, 1e-9)
     }
+
+    // Ranks compare a reading against its own recent history, so a signal
+    // held at a perfectly constant level ranks 0.5 forever and never reaches
+    // either decision band. Every fusion test therefore has to vary the level
+    // within a phase as well as between phases, which is also what a real
+    // ride looks like.
+    private class FusionFeed(private val engine: InferenceEngine) {
+        var now = 0L
+            private set
+        var last: InferenceResult? = null
+            private set
+        private var flip = false
+        private var seed = 12345L
+
+        fun run(magBase: Double, pressBase: Double, ticks: Int) {
+            repeat(ticks) {
+                flip = !flip
+                // Spread the values inside a phase so ranks are not all ties.
+                // The spread has to be irregular rather than a short repeating
+                // pattern: a periodic ripple makes the smoothed value swing
+                // across a decision line and reset the confirmation timer
+                // every cycle, so the state never settles at all. That is a
+                // real engine behaviour worth knowing about, but it is not
+                // what these tests are here to exercise.
+                seed = (seed * 6364136223846793005L + 1442695040888963407L)
+                val unit = ((seed ushr 33).toDouble() / (1L shl 31).toDouble())
+                val ripple = 0.85 + 0.3 * unit
+                last = engine.update(
+                    micRms = 0.0020, micValid = true, micPeak = 0.006,
+                    accelRms = 0.0, gyroDegreesRms = 0.0,
+                    magnetMagnitude = if (flip) magBase * ripple else 0.0,
+                    now = now,
+                    pressureHpa = 1013.0 + (if (flip) pressBase * ripple else 0.0),
+                )
+                now += 250L
+            }
+        }
+    }
+
+    @Test
+    fun fusionRevertsQuicklyFromAFalseStopCausedByASlowdown() {
+        // The field case this exists for: a hard slowdown that reads as a
+        // stop, then line speed again a few seconds later. What matters is
+        // not that the false stop is avoided but that it is undone fast,
+        // because a game layer can debounce a brief wrong state and cannot do
+        // anything about a long one.
+        val engine = InferenceEngine()
+        val feed = FusionFeed(engine)
+
+        feed.run(0.4, 0.004, 160)
+        feed.run(5.0, 0.08, 200)
+        assertEquals("运行", feed.last!!.trainState)
+
+        // Ten seconds quiet enough to rank at the bottom of a window that is
+        // otherwise all line speed.
+        feed.run(1.2, 0.012, 40)
+        val afterSlowdown = feed.last!!.trainState
+
+        // Back to line speed. If the slowdown did flip the state, the way
+        // back is a reversal and so needs only FUSION_REVERT_CONFIRMATION_MS
+        // rather than the full moving confirmation.
+        feed.run(5.0, 0.08, 10)
+        if (afterSlowdown == "停站") {
+            assertEquals("运行", feed.last!!.trainState)
+            assertTrue(feed.last!!.reason.startsWith("fusion-moving-revert"))
+        }
+
+        // A genuine stop later on is not a reversal and still takes the full
+        // confirmation, so it must not be mistaken for one.
+        feed.run(5.0, 0.08, 200)
+        assertEquals("运行", feed.last!!.trainState)
+        feed.run(0.4, 0.004, 120)
+        assertEquals("停站", feed.last!!.trainState)
+        assertEquals("fusion-stop-hold", feed.last!!.reason)
+    }
+
+    @Test
+    fun fusionReversalWindowExpiresSoALateSwingIsATransitionNotARevert() {
+        val engine = InferenceEngine()
+        val feed = FusionFeed(engine)
+        feed.run(5.0, 0.08, 200)
+        feed.run(0.4, 0.004, 160)
+        assertEquals("停站", feed.last!!.trainState)
+
+        // Well past FUSION_REVERT_WINDOW_MS, so going back to line speed is
+        // an ordinary transition and is reported as one.
+        feed.run(5.0, 0.08, 200)
+        assertEquals("运行", feed.last!!.trainState)
+        assertFalse(feed.last!!.reason.contains("revert"))
+        assertEquals(0L, feed.last!!.fusionLockoutRemainingMs)
+    }
 }

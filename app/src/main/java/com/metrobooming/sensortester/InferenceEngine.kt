@@ -149,6 +149,10 @@ data class InferenceResult(
     val fusionChannelCount: Int,
     val fusionStopCandidateElapsedMs: Long,
     val fusionMovingCandidateElapsedMs: Long,
+    // Milliseconds still to run on the post-transition lockout, 0 when it is
+    // not in force. Logged so a CSV shows when a transition was held back by
+    // it rather than by a lack of evidence.
+    val fusionLockoutRemainingMs: Long,
     // Echoes of this tick's GPS input, for CSV inspection/comparison. Null
     // whenever no fix was available this tick (no permission, no provider,
     // underground, or the last fix went stale — see GpsCollector).
@@ -362,6 +366,65 @@ class InferenceEngine(
         const val FUSION_STOP_CONFIRMATION_MS = 5_000L
         const val FUSION_MOVING_CONFIRMATION_MS = 3_000L
 
+        // After a transition is confirmed, refuse to confirm another one for
+        // this long. Aimed at a specific and repeatable field failure: a
+        // train slowing hard for a signal or a speed restriction without
+        // actually stopping. Both channels genuinely drop together (the
+        // 2026-09-19 22:03 ride went from a magnet jitter of 3.57 down to
+        // 1.54 and back up to 8.30 inside 30 seconds), so this is real
+        // deceleration rather than sensor noise, and the percentile rank has
+        // no way to tell "quietest in the last 90 seconds" apart from
+        // "actually stopped": after a couple of minutes at line speed, a mere
+        // slowdown ranks at the bottom of the window. The resulting false
+        // stops lasted 7 to 23 seconds, while genuine segments in the twelve
+        // labelled rides never ran shorter than 26 seconds (P10 36s, median
+        // 69s), so a lockout in between removes the former without touching
+        // the latter.
+        //
+        // Swept over those twelve rides against a stability-first objective
+        // (false flips first, missed transitions weighted heaviest, latency
+        // last): false flips fell from 14 to 10 with missed transitions
+        // unchanged at 2 and median latency up only 0.2s. Eleven of the
+        // twelve leave-one-out folds independently picked this value. Note
+        // the sub-26s "true" segments in the data are button mis-presses
+        // rather than train behaviour (one ride has 停站 at 9s and 运行 at
+        // 11s), which is why suppressing them costs no real transitions.
+        //
+        // This treats a symptom, not the cause: the rank normalisation's
+        // blindness to absolute scale is still there. Lengthening the rank
+        // window to 120~400s was tried and made everything worse, and an
+        // absolute floor does not separate (real stops median 0.95 against
+        // 1.35 for the false ones).
+        const val FUSION_STATE_LOCKOUT_MS = 0L
+
+        // Fast reversal. If the score swings back to the state held before
+        // the last transition, and does so soon after it, confirm the way
+        // back on this much shorter timer: a transition that wants undoing
+        // within seconds is itself evidence that it should not have happened.
+        //
+        // This replaced a 25s lockout that tried to suppress the same false
+        // transitions by refusing to confirm anything for a while after one.
+        // The lockout did cut their number, but it also blocked the recovery,
+        // so each surviving one lasted far longer; measured over the twelve
+        // labelled rides, the median false episode ran 42.3s under the
+        // lockout against 34.0s with nothing at all. Reversal goes the other
+        // way and shortens them to 9.5s, roughly a quarter, which is what
+        // matters when the game layer can debounce a brief wrong state on its
+        // own but cannot do anything about a long one.
+        //
+        // Swept with leave-one-out over those rides against "error time the
+        // game would actually notice" (episodes longer than its 3s debounce)
+        // plus the median false-episode length: 10 of the 12 folds picked
+        // exactly these values and all 12 picked this confirmation time.
+        //
+        // The cost is real and worth knowing: total noticed error time rises
+        // about 22s and transition latency about 52s across all twelve rides
+        // (roughly 0.7s per transition), because the same mechanism
+        // occasionally undoes a CORRECT transition when the score wobbles
+        // just after it, and the state then has to settle again.
+        const val FUSION_REVERT_CONFIRMATION_MS = 1_500L
+        const val FUSION_REVERT_WINDOW_MS = 20_000L
+
         // Switched on by default (2026-09-12), replacing the magnet-primary
         // field-test configuration below it. Turning this off falls back to
         // whatever MIC_DECISION_ENABLED_DEFAULT / MAGNET_PRIMARY_ENABLED_DEFAULT
@@ -522,6 +585,7 @@ class InferenceEngine(
         val channelCount: Int,
         val stopCandidateElapsedMs: Long,
         val movingCandidateElapsedMs: Long,
+        val lockoutRemainingMs: Long,
         // Non-null only when the fusion actually owns the decision this tick.
         val reason: String?,
     )
@@ -579,6 +643,10 @@ class InferenceEngine(
     private val magnetRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
     private val micRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
     private val pressureRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
+    private var fusionLastTransitionAt: Long? = null
+    // State held immediately before the last confirmed transition, so a swing
+    // straight back to it can be recognised as a reversal.
+    private var fusionPreviousState: String? = null
     private var fusionStopCandidateSince: Long? = null
     private var fusionMovingCandidateSince: Long? = null
     private val magnetCandidateVotes = ArrayDeque<MagnetCandidateVote>()
@@ -627,6 +695,8 @@ class InferenceEngine(
         magnetRankWindow.clear()
         micRankWindow.clear()
         pressureRankWindow.clear()
+        fusionLastTransitionAt = null
+        fusionPreviousState = null
         fusionStopCandidateSince = null
         fusionMovingCandidateSince = null
         magnetCalibrationSamples.clear()
@@ -1343,6 +1413,7 @@ class InferenceEngine(
             fusionChannelCount = fusionOutcome.channelCount,
             fusionStopCandidateElapsedMs = fusionOutcome.stopCandidateElapsedMs,
             fusionMovingCandidateElapsedMs = fusionOutcome.movingCandidateElapsedMs,
+            fusionLockoutRemainingMs = fusionOutcome.lockoutRemainingMs,
             gpsSpeedMps = gpsSpeedMps,
             gpsAccuracyM = gpsAccuracyM,
             gpsCalibrationStatus = gpsCalibrationStatus,
@@ -1496,6 +1567,7 @@ class InferenceEngine(
                 channelCount = ranks.size,
                 stopCandidateElapsedMs = 0L,
                 movingCandidateElapsedMs = 0L,
+                lockoutRemainingMs = 0L,
                 reason = if (authoritative) "fusion-warming-up-hold-state" else null,
             )
         }
@@ -1503,6 +1575,21 @@ class InferenceEngine(
         var stopElapsed = 0L
         var movingElapsed = 0L
         val reason: String
+        // Any candidate building during the lockout is dropped rather than
+        // carried, so a transition cannot fire the instant the lockout ends
+        // on the strength of evidence gathered while it was in force.
+        val lockedUntil = fusionLastTransitionAt?.plus(FUSION_STATE_LOCKOUT_MS)
+        val locked = lockedUntil != null && now < lockedUntil
+        val sinceLastTransition = fusionLastTransitionAt?.let { now - it }
+        // A reversal outranks the lockout: undoing a transition that should
+        // not have happened is the one move worth making while it is in
+        // force.
+        fun isReversal(target: String) =
+            fusionPreviousState == target &&
+                sinceLastTransition != null &&
+                sinceLastTransition < FUSION_REVERT_WINDOW_MS
+        fun requiredMs(target: String, normal: Long) =
+            if (isReversal(target)) FUSION_REVERT_CONFIRMATION_MS else normal
 
         when {
             score <= FUSION_STOP_SCORE -> {
@@ -1510,15 +1597,21 @@ class InferenceEngine(
                 if (stableTrainState == STATE_STOPPED) {
                     fusionStopCandidateSince = null
                     reason = "fusion-stop-hold"
+                } else if (locked && !isReversal(STATE_STOPPED)) {
+                    fusionStopCandidateSince = null
+                    reason = "fusion-stop-locked-out"
                 } else {
                     val since = fusionStopCandidateSince ?: now.also { fusionStopCandidateSince = it }
                     stopElapsed = (now - since).coerceAtLeast(0L)
-                    if (stopElapsed >= FUSION_STOP_CONFIRMATION_MS) {
+                    val reversal = isReversal(STATE_STOPPED)
+                    if (stopElapsed >= requiredMs(STATE_STOPPED, FUSION_STOP_CONFIRMATION_MS)) {
+                        fusionPreviousState = stableTrainState
                         stableTrainState = STATE_STOPPED
                         fusionStopCandidateSince = null
-                        reason = "fusion-stop-confirmed"
+                        fusionLastTransitionAt = now
+                        reason = if (reversal) "fusion-stop-reverted" else "fusion-stop-confirmed"
                     } else {
-                        reason = "fusion-stop-confirming"
+                        reason = if (reversal) "fusion-stop-reverting" else "fusion-stop-confirming"
                     }
                 }
             }
@@ -1527,15 +1620,21 @@ class InferenceEngine(
                 if (stableTrainState == STATE_MOVING) {
                     fusionMovingCandidateSince = null
                     reason = "fusion-moving-hold"
+                } else if (locked && !isReversal(STATE_MOVING)) {
+                    fusionMovingCandidateSince = null
+                    reason = "fusion-moving-locked-out"
                 } else {
                     val since = fusionMovingCandidateSince ?: now.also { fusionMovingCandidateSince = it }
                     movingElapsed = (now - since).coerceAtLeast(0L)
-                    if (movingElapsed >= FUSION_MOVING_CONFIRMATION_MS) {
+                    val reversal = isReversal(STATE_MOVING)
+                    if (movingElapsed >= requiredMs(STATE_MOVING, FUSION_MOVING_CONFIRMATION_MS)) {
+                        fusionPreviousState = stableTrainState
                         stableTrainState = STATE_MOVING
                         fusionMovingCandidateSince = null
-                        reason = "fusion-moving-confirmed"
+                        fusionLastTransitionAt = now
+                        reason = if (reversal) "fusion-moving-reverted" else "fusion-moving-confirmed"
                     } else {
-                        reason = "fusion-moving-confirming"
+                        reason = if (reversal) "fusion-moving-reverting" else "fusion-moving-confirming"
                     }
                 }
             }
@@ -1554,6 +1653,7 @@ class InferenceEngine(
             channelCount = ranks.size,
             stopCandidateElapsedMs = stopElapsed,
             movingCandidateElapsedMs = movingElapsed,
+            lockoutRemainingMs = if (locked) (lockedUntil!! - now).coerceAtLeast(0L) else 0L,
             reason = reason,
         )
     }
