@@ -50,6 +50,10 @@ extends Control
 # 敌人的碰撞手感），只是贴图画得比判定框大一圈，看着更醒目、更像个正经角色。
 @export var player_visual_scale: float = 1.9
 
+# 敌人美术相对各自判定框宽度的放大倍数，道理跟玩家那个一样。
+@export var ped_visual_scale: float = 1.6
+@export var rider_visual_scale: float = 1.5
+
 enum GameState { WAITING, CALIBRATING, RACE, STATION, SUMMARY }
 enum EnemyType { HAZARD, PEDESTRIAN, RIDER }
 
@@ -86,6 +90,8 @@ const UPGRADE_POOL := [
 var player: Control
 var player_sprite: AnimatedSprite2D
 var player_sprite_frames: SpriteFrames
+var ped_sprite_frames: SpriteFrames    # 行人/骑手贴图只需要建一份，多个敌人实例共用同一份 SpriteFrames
+var rider_sprite_frames: SpriteFrames
 var player_x := 0.0
 var touch_active := false     # 手指/鼠标是否按住——按住才移动，松手立刻停
 var touch_target_x := 0.0     # 按住的目标 x，player_x 每帧朝它平滑追过去，不再瞬移
@@ -429,51 +435,83 @@ func _build_enemy_visual(type: int, size: Vector2) -> Control:
 	match type:
 		EnemyType.PEDESTRIAN:
 			_build_pedestrian_visual(container, size)
-			_add_center_label(container, ENEMY_LABEL[type])
+			_add_center_label(container, ENEMY_LABEL[type], size.y * 0.82, size.y * 0.18)
 		EnemyType.RIDER:
 			_build_rider_visual(container, size)
-			_add_center_label(container, ENEMY_LABEL[type])
+			_add_center_label(container, ENEMY_LABEL[type], size.y * 0.86, size.y * 0.14)
 		EnemyType.HAZARD:
 			_build_hazard_visual(container, size)
 	return container
 
 
-func _build_pedestrian_visual(container: Control, size: Vector2) -> void:
-	var head_size := Vector2(size.x * 0.42, size.x * 0.42)
-	var head := ColorRect.new()
-	head.size = head_size
-	head.color = Color(0.6, 0.78, 1.0)
-	head.position = Vector2((size.x - head_size.x) * 0.5, 0.0)
-	container.add_child(head)
+func _build_ped_sprite_frames() -> SpriteFrames:
+	if ped_sprite_frames:
+		return ped_sprite_frames
+	var frames := SpriteFrames.new()
+	frames.remove_animation("default")
 
-	var body := ColorRect.new()
-	body.size = Vector2(size.x * 0.82, size.y - head_size.y * 0.7)
-	body.color = Color(0.3, 0.5, 0.9)
-	body.position = Vector2((size.x - body.size.x) * 0.5, head_size.y * 0.7)
-	container.add_child(body)
+	frames.add_animation("walk")
+	frames.set_animation_loop("walk", true)
+	frames.set_animation_speed("walk", 10.0)  # 8 帧循环，走路节奏别太赶
+	for i in range(8):
+		var path := "res://art/ped/animations/walk/frame_%03d.png" % i
+		frames.add_frame("walk", load(path))
+
+	ped_sprite_frames = frames
+	return frames
+
+
+func _build_rider_sprite_frames() -> SpriteFrames:
+	if rider_sprite_frames:
+		return rider_sprite_frames
+	var frames := SpriteFrames.new()
+	frames.remove_animation("default")
+
+	frames.add_animation("idle")
+	frames.set_animation_loop("idle", true)
+	frames.set_animation_speed("idle", 1.0)
+	frames.add_frame("idle", load("res://art/rider/rotations/south.png"))
+
+	frames.add_animation("attack")
+	frames.set_animation_loop("attack", false)
+	frames.set_animation_speed("attack", 12.0)
+	for i in range(9):
+		var path := "res://art/rider/animations/attack_throw/frame_%03d.png" % i
+		frames.add_frame("attack", load(path))
+
+	rider_sprite_frames = frames
+	return frames
+
+
+func _build_pedestrian_visual(container: Control, size: Vector2) -> void:
+	var sprite := AnimatedSprite2D.new()
+	sprite.sprite_frames = _build_ped_sprite_frames()
+	sprite.animation = "walk"
+	sprite.play("walk")
+	var tex_width: float = float(sprite.sprite_frames.get_frame_texture("walk", 0).get_width())
+	var scale_factor: float = (size.x * ped_visual_scale) / tex_width
+	sprite.scale = Vector2(scale_factor, scale_factor)
+	sprite.position = size * 0.5  # AnimatedSprite2D 锚点在中心，摆在判定框正中间
+	container.add_child(sprite)
 
 
 func _build_rider_visual(container: Control, size: Vector2) -> void:
-	var body := ColorRect.new()
-	body.size = size
-	body.color = Color(0.75, 0.25, 0.85)
-	container.add_child(body)
-
-	var head_size := Vector2(size.x * 0.3, size.x * 0.3)
-	var head := ColorRect.new()
-	head.size = head_size
-	head.color = Color(0.9, 0.65, 0.95)
-	head.position = Vector2((size.x - head_size.x) * 0.5, size.y * 0.06)
-	container.add_child(head)
-
-	var wheel_size := Vector2(size.x * 0.22, size.x * 0.22)
-	var wheel_y := size.y - wheel_size.y * 0.65
-	for side in [0.06, 1.0 - 0.06 - 0.22]:
-		var wheel := ColorRect.new()
-		wheel.size = wheel_size
-		wheel.color = Color(0.12, 0.05, 0.18)
-		wheel.position = Vector2(size.x * side, wheel_y)
-		container.add_child(wheel)
+	var sprite := AnimatedSprite2D.new()
+	sprite.sprite_frames = _build_rider_sprite_frames()
+	sprite.animation = "idle"
+	sprite.play("idle")
+	# 丢外卖的攻击动作打完自动切回待机，别一直卡在攻击姿势上。
+	sprite.animation_finished.connect(func() -> void:
+		if sprite.animation == "attack":
+			sprite.play("idle")
+	)
+	var tex_width: float = float(sprite.sprite_frames.get_frame_texture("idle", 0).get_width())
+	var scale_factor: float = (size.x * rider_visual_scale) / tex_width
+	sprite.scale = Vector2(scale_factor, scale_factor)
+	sprite.position = size * 0.5
+	container.add_child(sprite)
+	# 存个引用，_update_enemies() 每次这只骑手真的开火时用它触发一下攻击动作。
+	container.set_meta("char_sprite", sprite)
 
 
 func _build_hazard_visual(container: Control, size: Vector2) -> void:
@@ -532,6 +570,9 @@ func _update_enemies(delta: float, speed: float) -> void:
 			e.fire_timer -= delta
 			if e.fire_timer <= 0.0:
 				_spawn_enemy_bullet(node.position + e.size * 0.5)
+				if node.has_meta("char_sprite"):
+					var rider_sprite: AnimatedSprite2D = node.get_meta("char_sprite")
+					rider_sprite.play("attack")  # 每次真的丢东西过来，就配一下丢外卖的甩臂动作
 				e.fire_timer = randf_range(RIDER_FIRE_INTERVAL_MIN, RIDER_FIRE_INTERVAL_MAX)
 
 		if node.position.y > play_area_height:
