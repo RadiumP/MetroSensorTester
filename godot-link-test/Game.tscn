@@ -35,7 +35,7 @@ offset_top=140.0
 offset_right=1040.0
 offset_bottom=200.0
 theme_override_font_sizes/font_size=30
-text="送达 0  ·  差评 0  ·  信誉分 100"
+text="击落 0  ·  差评 0  ·  信誉分 100"
 
 [node name="DebugLabel" type="Label" parent="HUD"]
 offset_left=40.0
@@ -43,24 +43,26 @@ offset_top=1800.0
 offset_right=1040.0
 offset_bottom=1880.0
 theme_override_font_sizes/font_size=22
-text="intensity=0.00  hazard=0.00  lane=1  state="
+text="intensity=0.00  hazard=0.00  fire=0.45s x1 dmg1  state="
 
 [node name="LeftHint" type="Label" parent="HUD"]
 offset_left=20.0
 offset_top=1650.0
-offset_right=260.0
+offset_right=1060.0
 offset_bottom=1720.0
 theme_override_font_sizes/font_size=28
-text="◀ 点左半屏"
+text="拖动屏幕跟手移动 · 武器自动开火"
+horizontal_alignment=1
 modulate=Color(1, 1, 1, 0.5)
 
 [node name="RightHint" type="Label" parent="HUD"]
+visible=false
 offset_left=820.0
 offset_top=1650.0
 offset_right=1060.0
 offset_bottom=1720.0
 theme_override_font_sizes/font_size=28
-text="点右半屏 ▶"
+text=""
 horizontal_alignment=2
 modulate=Color(1, 1, 1, 0.5)
 
