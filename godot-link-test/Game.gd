@@ -10,7 +10,8 @@ extends Control
 # 扶把手的场景；武器/敌人先用色块占位，正式美术和"花生米/肥宅水"等食物梗
 # 武器视觉留到下一步。完整设计见仓库根目录 RICE_RIDER_DESIGN.md。
 #
-# 操作：手指按住屏幕任意位置拖动 = 车身跟手左右移动。武器自动开火，不用按键。
+# 操作：手指按住屏幕任意位置 = 朝那个方向平滑移动过去（类似按住方向键），松手就停，
+# 不再是按哪瞬移到哪。武器自动开火，不用按键。
 
 # ==== 实地测试后需要回来调的常量 ====
 # accel_rms / gyro_rms_deg_s 的真实取值范围目前是拍的，先跑几趟地铁，对照
@@ -39,6 +40,15 @@ extends Control
 @export var standalone_mode: bool = false
 @export var standalone_run_seconds: float = 60.0
 @export var standalone_station_seconds: float = 20.0
+
+# 按住屏幕时车身朝手指方向平移的速度（px/秒）——"模拟按键"手感的核心：不再是
+# 按哪瞬移到哪，而是按住之后每帧朝目标位置匀速追过去，松手立刻停，跟按住方向键
+# 松开一样干脆。数值大概是横穿 1080 宽度全屏约 1.1 秒，嫌快/慢就调这个。
+@export var player_move_speed: float = 980.0
+
+# 玩家美术相对判定框宽度的放大倍数。判定框（PLAYER_SIZE）本身不变（不影响和
+# 敌人的碰撞手感），只是贴图画得比判定框大一圈，看着更醒目、更像个正经角色。
+@export var player_visual_scale: float = 1.9
 
 enum GameState { WAITING, CALIBRATING, RACE, STATION, SUMMARY }
 enum EnemyType { HAZARD, PEDESTRIAN, RIDER }
@@ -77,7 +87,8 @@ var player: Control
 var player_sprite: AnimatedSprite2D
 var player_sprite_frames: SpriteFrames
 var player_x := 0.0
-var dragging := false
+var touch_active := false     # 手指/鼠标是否按住——按住才移动，松手立刻停
+var touch_target_x := 0.0     # 按住的目标 x，player_x 每帧朝它平滑追过去，不再瞬移
 var play_area_width := 1080.0
 var play_area_height := 1920.0
 
@@ -164,6 +175,7 @@ func _process(delta: float) -> void:
 		_advance_simulation(delta)
 
 	if game_state == GameState.RACE:
+		_update_player_movement(delta)
 		_update_race(delta)
 
 	_update_debug_label()
@@ -184,8 +196,9 @@ func _spawn_player() -> void:
 	player_sprite.sprite_frames = player_sprite_frames
 	player_sprite.animation_finished.connect(_on_player_sprite_animation_finished)
 	# PixelLab 出的素材是 92px(待机)/108px(开火，手臂甩出去比 idle 帧宽) 的正方形
-	# 贴图，跟判定框宽度对齐做个统一缩放，位置往判定框上半部分放（车头朝前）。
-	var scale_factor: float = (PLAYER_SIZE.x * 1.05) / 92.0
+	# 贴图。按 player_visual_scale 把美术画得比判定框更大更醒目（判定框本身不变，
+	# 不影响跟敌人的碰撞手感），位置往判定框上半部分放（车头朝前）。
+	var scale_factor: float = (PLAYER_SIZE.x * player_visual_scale) / 92.0
 	player_sprite.scale = Vector2(scale_factor, scale_factor)
 	player_sprite.position = Vector2(PLAYER_SIZE.x * 0.5, PLAYER_SIZE.y * 0.42)
 	player_sprite.play("idle")
@@ -222,29 +235,34 @@ func _reposition_player() -> void:
 	player.position = Vector2(player_x - PLAYER_SIZE.x * 0.5, play_area_height - 280.0)
 
 
-func _set_player_x(x: float) -> void:
+func _update_player_movement(delta: float) -> void:
+	if not touch_active:
+		return  # 松手不追、不滑行，跟松开方向键一样立刻停
 	var half := PLAYER_SIZE.x * 0.5
-	player_x = clamp(x, half, play_area_width - half)
+	var target: float = clamp(touch_target_x, half, play_area_width - half)
+	player_x = move_toward(player_x, target, player_move_speed * delta)
 	_reposition_player()
 
 
 func _unhandled_input(event: InputEvent) -> void:
 	if game_state != GameState.RACE:
 		return
+	# 只更新"按住的目标位置"，真正的移动放到 _update_player_movement() 里按固定
+	# 速度平滑追过去——这样按住不动也好、拖着手指跑也好，车身都不会瞬移。
 	if event is InputEventScreenTouch:
-		dragging = event.pressed
+		touch_active = event.pressed
 		if event.pressed:
-			_set_player_x(event.position.x)
+			touch_target_x = event.position.x
 	elif event is InputEventScreenDrag:
-		if dragging:
-			_set_player_x(event.position.x)
+		if touch_active:
+			touch_target_x = event.position.x
 	elif event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT:
-		dragging = event.pressed
+		touch_active = event.pressed
 		if event.pressed:
-			_set_player_x(event.position.x)
+			touch_target_x = event.position.x
 	elif event is InputEventMouseMotion:
-		if dragging:
-			_set_player_x(event.position.x)
+		if touch_active:
+			touch_target_x = event.position.x
 
 
 # ==== GameLink 数据 -> 状态机 ====
@@ -313,6 +331,7 @@ func _set_state(new_state: int) -> void:
 			waiting_overlay.visible = false
 			upgrade_overlay.visible = false
 			upgrade_shown_this_stop = false
+			touch_active = false  # 避免进 RACE 前残留的按住状态让车身莫名其妙自己动起来
 		GameState.STATION:
 			state_label.text = "停站 · 补给"
 			_clear_battlefield()
