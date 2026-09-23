@@ -48,11 +48,12 @@ extends Control
 
 # 玩家美术相对判定框宽度的放大倍数。判定框（PLAYER_SIZE）本身不变（不影响和
 # 敌人的碰撞手感），只是贴图画得比判定框大一圈，看着更醒目、更像个正经角色。
-@export var player_visual_scale: float = 1.9
+@export var player_visual_scale: float = 2.2
 
-# 敌人美术相对各自判定框宽度的放大倍数，道理跟玩家那个一样。
-@export var ped_visual_scale: float = 1.6
-@export var rider_visual_scale: float = 1.5
+# 行人/骑手美术统一按这个绝对像素宽度画，而不是各自按判定框比例缩放——两者
+# 判定框大小本来就不一样（行人 90 宽，骑手 140 宽），照各自比例缩就会一个明显
+# 比另一个小；直接给个共同目标宽度，两种敌人看起来才是同一个体格量级。
+@export var enemy_char_visual_width: float = 230.0
 
 enum GameState { WAITING, CALIBRATING, RACE, STATION, SUMMARY }
 enum EnemyType { HAZARD, PEDESTRIAN, RIDER }
@@ -68,13 +69,6 @@ const PLAYER_BULLET_SPEED := 1100.0   # px/sec，向上
 const ENEMY_BULLET_SPEED := 480.0     # px/sec，向下
 const RIDER_FIRE_INTERVAL_MIN := 1.0
 const RIDER_FIRE_INTERVAL_MAX := 1.7
-
-# 占位美术阶段先用英文短标签认清楚方块是什么，正式美术替换掉色块之后可以去掉。
-const ENEMY_LABEL := {
-	EnemyType.HAZARD: "HAZARD",
-	EnemyType.PEDESTRIAN: "PED",
-	EnemyType.RIDER: "RIDER",
-}
 
 # 三选一卡池：花生米/肥宅水是武器升级，后三张是延续 v0.1 的防御类卡片。
 # 后续要扩到"辣条鞭""奶茶炸弹"等主动技能，先把数值骨架跑通。
@@ -111,8 +105,9 @@ var fire_timer := 0.0
 var current_intensity := 0.0
 var current_hazard_chance := 0.0
 
-# 武器状态（三选一升级会改这几个数）
-var fire_interval := 0.45
+# 武器状态（三选一升级会改这几个数）。初始射速调慢一点（间隔从 0.45s 提到
+# 0.65s），不然一开局就跟机枪似的，清场太轻松，后面靠"花生米连发"卡片慢慢升上去。
+var fire_interval := 0.65
 var bullet_count := 1
 var bullet_damage := 1
 
@@ -435,10 +430,8 @@ func _build_enemy_visual(type: int, size: Vector2) -> Control:
 	match type:
 		EnemyType.PEDESTRIAN:
 			_build_pedestrian_visual(container, size)
-			_add_center_label(container, ENEMY_LABEL[type], size.y * 0.82, size.y * 0.18)
 		EnemyType.RIDER:
 			_build_rider_visual(container, size)
-			_add_center_label(container, ENEMY_LABEL[type], size.y * 0.86, size.y * 0.14)
 		EnemyType.HAZARD:
 			_build_hazard_visual(container, size)
 	return container
@@ -489,7 +482,7 @@ func _build_pedestrian_visual(container: Control, size: Vector2) -> void:
 	sprite.animation = "walk"
 	sprite.play("walk")
 	var tex_width: float = float(sprite.sprite_frames.get_frame_texture("walk", 0).get_width())
-	var scale_factor: float = (size.x * ped_visual_scale) / tex_width
+	var scale_factor: float = enemy_char_visual_width / tex_width
 	sprite.scale = Vector2(scale_factor, scale_factor)
 	sprite.position = size * 0.5  # AnimatedSprite2D 锚点在中心，摆在判定框正中间
 	container.add_child(sprite)
@@ -506,7 +499,7 @@ func _build_rider_visual(container: Control, size: Vector2) -> void:
 			sprite.play("idle")
 	)
 	var tex_width: float = float(sprite.sprite_frames.get_frame_texture("idle", 0).get_width())
-	var scale_factor: float = (size.x * rider_visual_scale) / tex_width
+	var scale_factor: float = enemy_char_visual_width / tex_width
 	sprite.scale = Vector2(scale_factor, scale_factor)
 	sprite.position = size * 0.5
 	container.add_child(sprite)
@@ -531,23 +524,6 @@ func _build_hazard_visual(container: Control, size: Vector2) -> void:
 	bang.add_theme_color_override("font_outline_color", Color(0, 0, 0))
 	bang.add_theme_constant_override("outline_size", 5)
 	container.add_child(bang)
-
-	_add_center_label(container, ENEMY_LABEL[EnemyType.HAZARD], size.y * 0.68, size.y * 0.3)
-
-
-func _add_center_label(container: Control, text: String, label_top: float = 0.0, label_height: float = -1.0) -> void:
-	var label := Label.new()
-	label.text = text
-	label.position = Vector2(0.0, label_top)
-	label.size = Vector2(container.size.x, label_height if label_height > 0.0 else container.size.y - label_top)
-	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	label.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	label.add_theme_font_size_override("font_size", 20)
-	label.add_theme_color_override("font_color", Color(1, 1, 1))
-	label.add_theme_color_override("font_outline_color", Color(0, 0, 0))
-	label.add_theme_constant_override("outline_size", 4)
-	container.add_child(label)
 
 
 func _update_enemies(delta: float, speed: float) -> void:
@@ -749,7 +725,7 @@ func _on_restart_pressed() -> void:
 	speed_multiplier = 1.0
 	shield_charges = 0
 	hazard_chance_multiplier = 1.0
-	fire_interval = 0.45
+	fire_interval = 0.65
 	bullet_count = 1
 	bullet_damage = 1
 	player_x = play_area_width * 0.5
