@@ -104,6 +104,8 @@ class GameLinkServer {
         micLevelRatio: Double,
         accelRms: Double,
         gyroRmsDegS: Double,
+        confidence: String,
+        confidenceReady: Boolean,
     ) {
         // Safe to check on the caller's (main) thread — only guards an early
         // return, no I/O happens here.
@@ -119,6 +121,17 @@ class GameLinkServer {
             put("mic_level_ratio", micLevelRatio)
             put("accel_rms", accelRms)
             put("gyro_rms_deg_s", gyroRmsDegS)
+            // "低" means the engine is holding 停站 while both primary
+            // channels read well above this ride's own stops. The state is
+            // still the engine's best guess and is unchanged by this field;
+            // the game decides whether to act on the doubt, for example by
+            // freezing level transitions rather than switching scenes on a
+            // verdict that may be wrong.
+            put("confidence", confidence)
+            // False until enough confirmed stops have accumulated to judge
+            // confidence at all, which is the window the game covers with
+            // its fixed warmup round.
+            put("confidence_ready", confidenceReady)
         }
         val line = (json.toString() + "\n").toByteArray(Charsets.UTF_8)
         // The actual socket write is the network I/O part — runs on ioExecutor,

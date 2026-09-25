@@ -153,6 +153,24 @@ data class InferenceResult(
     // not in force. Logged so a CSV shows when a transition was held back by
     // it rather than by a lack of evidence.
     val fusionLockoutRemainingMs: Long,
+    // This ride's learned stop level per primary channel, and whether enough
+    // confirmed stop samples have accumulated for it to mean anything. Null
+    // until then. Purely diagnostic: nothing in the decision path reads
+    // these.
+    val fusionStopReferenceReady: Boolean,
+    val fusionStopReferenceMagnet: Double?,
+    val fusionStopReferencePressure: Double?,
+    // CONFIDENCE_LOW while the engine holds 停站 but both primary channels
+    // read well above what this ride's own stops look like, which is the
+    // under-river signature: every channel's rank collapses because the
+    // trailing window holds nothing but running, while the absolute levels
+    // never came down. The state itself is unaffected; this only says the
+    // engine has reason to doubt it.
+    val fusionConfidence: String,
+    // Highest per-channel ratio of current value to learned stop level, so a
+    // CSV shows how far off the reading was rather than just that a
+    // threshold tripped. Null before the reference is ready.
+    val fusionReferenceDeviation: Double?,
     // Echoes of this tick's GPS input, for CSV inspection/comparison. Null
     // whenever no fix was available this tick (no permission, no provider,
     // underground, or the last fix went stale — see GpsCollector).
@@ -453,6 +471,43 @@ class InferenceEngine(
         // so a later sweep can revisit this without another field test.
         val FUSION_PRIMARY_CHANNELS = setOf("magnet", "pressure")
 
+        // Rolling span of confirmed stop samples that make up this ride's
+        // stop reference. Rolling rather than cumulative so an interchange
+        // between lines cannot leave the reference stuck on the old line's
+        // magnetic and barometric levels.
+        const val FUSION_STOP_REFERENCE_SPAN_MS = 600_000L
+
+        // Confirmed stop samples needed before the reference is considered
+        // usable. Eight ticks is two seconds of a real platform stop, which
+        // is short enough that the reference exists from the first station
+        // and long enough not to be built out of a single noisy tick.
+        const val FUSION_STOP_REFERENCE_MIN_SAMPLES = 8
+
+        // How far above this ride's learned stop level a channel has to sit
+        // before it counts as contradicting a stop verdict.
+        //
+        // Where this came from, and what it is honestly worth: on the eleven
+        // labelled rides the flag fires for about 9 percent of the time the
+        // engine spends in 停站, and 46 percent of that time the engine is in
+        // fact wrong. Against a 10.7 percent base error rate that is roughly
+        // a four times lift, and the lift holds per ride rather than resting
+        // on one of them.
+        //
+        // What it does NOT do, which matters more for anyone tuning this:
+        // the flag covers only 0 to 22 percent of the longest stuck errors.
+        // Those turn out mostly not to be the kind where the absolute level
+        // contradicts the reference, so this is a damage reducer, not a
+        // solution to the stuck stop problem.
+        //
+        // Both channels have to exceed the multiple. Requiring only one
+        // drops precision from 46 to 34 percent while firing five times as
+        // often, which is the wrong trade for a signal the game reacts to.
+        const val FUSION_STOP_REFERENCE_MARGIN = 1.8
+
+        const val CONFIDENCE_HIGH = "高"
+        const val CONFIDENCE_LOW = "低"
+        const val CONFIDENCE_NOT_READY = "未就绪"
+
         // Defaults for the two field-test switches (2026-09-10): with the
         // mic channel off, a ride isolates what the magnet channel can do on
         // its own. Both flipped back (mic true / magnet false) restores the
@@ -577,6 +632,40 @@ class InferenceEngine(
         }
     }
 
+    // Rolling window of one channel's values sampled only while the engine
+    // was confirmed to be stopped, exposing their median as this ride's stop
+    // level. Deliberately not a RankWindow: the whole point is to keep the
+    // absolute scale that rank normalisation throws away.
+    private class ReferenceWindow(private val spanMs: Long, private val minSamples: Int) {
+        private val timestamps = ArrayDeque<Long>()
+        private val values = ArrayDeque<Double>()
+
+        fun clear() {
+            timestamps.clear()
+            values.clear()
+        }
+
+        fun push(value: Double, now: Long) {
+            timestamps.addLast(now)
+            values.addLast(value)
+            trim(now)
+        }
+
+        fun median(now: Long): Double? {
+            trim(now)
+            if (values.size < minSamples) return null
+            val sorted = values.sorted()
+            return sorted[(sorted.size - 1) / 2]
+        }
+
+        private fun trim(now: Long) {
+            while (timestamps.firstOrNull()?.let { it < now - spanMs } == true) {
+                timestamps.removeFirst()
+                values.removeFirst()
+            }
+        }
+    }
+
     private data class FusionOutcome(
         val magnetRank: Double?,
         val micRank: Double?,
@@ -586,6 +675,11 @@ class InferenceEngine(
         val stopCandidateElapsedMs: Long,
         val movingCandidateElapsedMs: Long,
         val lockoutRemainingMs: Long,
+        val stopReferenceReady: Boolean,
+        val stopReferenceMagnet: Double?,
+        val stopReferencePressure: Double?,
+        val confidence: String,
+        val referenceDeviation: Double?,
         // Non-null only when the fusion actually owns the decision this tick.
         val reason: String?,
     )
@@ -643,6 +737,10 @@ class InferenceEngine(
     private val magnetRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
     private val micRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
     private val pressureRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
+    private val magnetStopReference =
+        ReferenceWindow(FUSION_STOP_REFERENCE_SPAN_MS, FUSION_STOP_REFERENCE_MIN_SAMPLES)
+    private val pressureStopReference =
+        ReferenceWindow(FUSION_STOP_REFERENCE_SPAN_MS, FUSION_STOP_REFERENCE_MIN_SAMPLES)
     private var fusionLastTransitionAt: Long? = null
     // State held immediately before the last confirmed transition, so a swing
     // straight back to it can be recognised as a reversal.
@@ -695,6 +793,8 @@ class InferenceEngine(
         magnetRankWindow.clear()
         micRankWindow.clear()
         pressureRankWindow.clear()
+        magnetStopReference.clear()
+        pressureStopReference.clear()
         fusionLastTransitionAt = null
         fusionPreviousState = null
         fusionStopCandidateSince = null
@@ -1414,6 +1514,11 @@ class InferenceEngine(
             fusionStopCandidateElapsedMs = fusionOutcome.stopCandidateElapsedMs,
             fusionMovingCandidateElapsedMs = fusionOutcome.movingCandidateElapsedMs,
             fusionLockoutRemainingMs = fusionOutcome.lockoutRemainingMs,
+            fusionStopReferenceReady = fusionOutcome.stopReferenceReady,
+            fusionStopReferenceMagnet = fusionOutcome.stopReferenceMagnet,
+            fusionStopReferencePressure = fusionOutcome.stopReferencePressure,
+            fusionConfidence = fusionOutcome.confidence,
+            fusionReferenceDeviation = fusionOutcome.referenceDeviation,
             gpsSpeedMps = gpsSpeedMps,
             gpsAccuracyM = gpsAccuracyM,
             gpsCalibrationStatus = gpsCalibrationStatus,
@@ -1540,6 +1645,32 @@ class InferenceEngine(
         val micRank = micSmoothed?.let { micRankWindow.pushAndRank(it, now) }
         val pressureRank = pressureChangeRateSmoothed?.let { pressureRankWindow.pushAndRank(it, now) }
 
+        // Feed this ride's stop reference from whatever the channels read
+        // while the engine is already settled on 停站. Done before the
+        // verdict below so the reference always describes stops that were
+        // confirmed, never the tick currently under consideration.
+        if (stableTrainState == STATE_STOPPED) {
+            magnetJitterSmoothed?.let { magnetStopReference.push(it, now) }
+            pressureChangeRateSmoothed?.let { pressureStopReference.push(it, now) }
+        }
+        val magnetStopLevel = magnetStopReference.median(now)
+        val pressureStopLevel = pressureStopReference.median(now)
+        val referenceReady = magnetStopLevel != null && pressureStopLevel != null
+        val deviations = listOfNotNull(
+            ratioOrNull(magnetJitterSmoothed, magnetStopLevel),
+            ratioOrNull(pressureChangeRateSmoothed, pressureStopLevel),
+        )
+        val referenceDeviation = deviations.maxOrNull()
+        val confidence = when {
+            !referenceReady -> CONFIDENCE_NOT_READY
+            stableTrainState != STATE_STOPPED -> CONFIDENCE_HIGH
+            // Both channels have to disagree. See FUSION_STOP_REFERENCE_MARGIN
+            // for what happens to precision when only one is required.
+            deviations.size >= 2 && deviations.all { it > FUSION_STOP_REFERENCE_MARGIN } ->
+                CONFIDENCE_LOW
+            else -> CONFIDENCE_HIGH
+        }
+
         // Normal case: the two primary channels. Mic joins only to keep the
         // fusion alive when fewer than two primaries are reporting.
         val primary = listOfNotNull(
@@ -1568,6 +1699,11 @@ class InferenceEngine(
                 stopCandidateElapsedMs = 0L,
                 movingCandidateElapsedMs = 0L,
                 lockoutRemainingMs = 0L,
+                stopReferenceReady = referenceReady,
+                stopReferenceMagnet = magnetStopLevel,
+                stopReferencePressure = pressureStopLevel,
+                confidence = confidence,
+                referenceDeviation = referenceDeviation,
                 reason = if (authoritative) "fusion-warming-up-hold-state" else null,
             )
         }
@@ -1654,8 +1790,22 @@ class InferenceEngine(
             stopCandidateElapsedMs = stopElapsed,
             movingCandidateElapsedMs = movingElapsed,
             lockoutRemainingMs = if (locked) (lockedUntil!! - now).coerceAtLeast(0L) else 0L,
+            stopReferenceReady = referenceReady,
+            stopReferenceMagnet = magnetStopLevel,
+            stopReferencePressure = pressureStopLevel,
+            confidence = confidence,
+            referenceDeviation = referenceDeviation,
             reason = reason,
         )
+    }
+
+    // How many times this ride's learned stop level the current reading is.
+    // Null when either side is missing or the reference is not a usable
+    // divisor, so a missing channel drops out of the comparison instead of
+    // poisoning it with a zero.
+    private fun ratioOrNull(value: Double?, reference: Double?): Double? {
+        if (value == null || reference == null || reference <= 0.0) return null
+        return value / reference
     }
 
     // Runs the magnet channel's one-time usability test and, once passed and

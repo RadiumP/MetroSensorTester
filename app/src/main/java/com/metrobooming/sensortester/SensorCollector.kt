@@ -19,6 +19,29 @@ import kotlin.math.sqrt
 data class SensorSnapshot(
     val accelRms: Double,
     val accelPeak: Double,
+    // Most recent linear (gravity removed) acceleration sample in device
+    // coordinates. accelRms above is a magnitude, so it cannot tell a train
+    // accelerating forwards from a phone being shaken; these keep the
+    // direction the magnitude throws away.
+    val accelX: Float?,
+    val accelY: Float?,
+    val accelZ: Float?,
+    // The gravity vector the device frame is tilted against, logged so an
+    // offline pass can re-derive the horizontal plane without replaying the
+    // rotation vector.
+    val gravityX: Float?,
+    val gravityY: Float?,
+    val gravityZ: Float?,
+    // Tick means of the linear acceleration rotated into the world frame
+    // (East / North / Up). The mean, not the RMS, is the point: handling a
+    // phone produces a roughly zero mean because the hand comes back, while
+    // a train accelerating along the track produces a sustained bias that
+    // survives averaging. Null when the rotation vector was unavailable, so
+    // no world frame could be established.
+    val accelWorldEastMean: Double?,
+    val accelWorldNorthMean: Double?,
+    val accelWorldUpMean: Double?,
+    val accelWorldSamples: Int,
     val gyroRms: Double,
     val gyroPeak: Double,
     val gyroX: Float?,
@@ -87,6 +110,17 @@ class SensorCollector(private val context: Context) : SensorEventListener {
     private var pressureHpa: Float? = null
     private var rawAcceleration: FloatArray? = null
     private var rawMagnetic: FloatArray? = null
+    private var accelX: Float? = null
+    private var accelY: Float? = null
+    private var accelZ: Float? = null
+    // Device to world rotation, kept from the last rotation vector event so
+    // recordAcceleration can project into the world frame as samples arrive
+    // rather than only at snapshot time.
+    private var deviceToWorld: FloatArray? = null
+    private var accelWorldEastSum = 0.0
+    private var accelWorldNorthSum = 0.0
+    private var accelWorldUpSum = 0.0
+    private var accelWorldCount = 0
     private var compassMagneticAzimuthDeg: Double? = null
     private var compassSource = "不可用"
     private var magnetAccuracy: Int? = null
@@ -95,7 +129,9 @@ class SensorCollector(private val context: Context) : SensorEventListener {
     private var declinationLocationTimeMs: Long? = null
     private var lastDeclinationRefreshAt = 0L
 
-    // Used only when TYPE_LINEAR_ACCELERATION is unavailable.
+    // Low passed accelerometer, i.e. the gravity direction. Feeds the
+    // fallback linear acceleration when TYPE_LINEAR_ACCELERATION is missing,
+    // and is logged every tick either way.
     private val gravity = FloatArray(3)
 
     fun capabilities(): List<SensorCapability> = listOf(
@@ -148,11 +184,15 @@ class SensorCollector(private val context: Context) : SensorEventListener {
 
                 Sensor.TYPE_ACCELEROMETER -> {
                     rawAcceleration = event.values.copyOf(3)
+                    // The low pass runs unconditionally now. It used to be
+                    // needed only as a fallback path, but gravity is logged
+                    // every tick, so it has to be maintained even when
+                    // TYPE_LINEAR_ACCELERATION is doing the real work.
+                    val alpha = 0.8f
+                    for (i in 0..2) {
+                        gravity[i] = alpha * gravity[i] + (1f - alpha) * event.values[i]
+                    }
                     if (linearAcceleration == null) {
-                        val alpha = 0.8f
-                        for (i in 0..2) {
-                            gravity[i] = alpha * gravity[i] + (1f - alpha) * event.values[i]
-                        }
                         recordAcceleration(
                             event.values[0] - gravity[0],
                             event.values[1] - gravity[1],
@@ -229,6 +269,16 @@ class SensorCollector(private val context: Context) : SensorEventListener {
             val result = SensorSnapshot(
                 accelRms = if (accelCount > 0) sqrt(accelSquareSum / accelCount) else 0.0,
                 accelPeak = accelPeak,
+                accelX = accelX,
+                accelY = accelY,
+                accelZ = accelZ,
+                gravityX = gravity[0],
+                gravityY = gravity[1],
+                gravityZ = gravity[2],
+                accelWorldEastMean = if (accelWorldCount > 0) accelWorldEastSum / accelWorldCount else null,
+                accelWorldNorthMean = if (accelWorldCount > 0) accelWorldNorthSum / accelWorldCount else null,
+                accelWorldUpMean = if (accelWorldCount > 0) accelWorldUpSum / accelWorldCount else null,
+                accelWorldSamples = accelWorldCount,
                 gyroRms = if (gyroCount > 0) sqrt(gyroSquareSum / gyroCount) else 0.0,
                 gyroPeak = gyroPeak,
                 gyroX = gyroX,
@@ -257,6 +307,10 @@ class SensorCollector(private val context: Context) : SensorEventListener {
             accelSquareSum = 0.0
             accelCount = 0
             accelPeak = 0.0
+            accelWorldEastSum = 0.0
+            accelWorldNorthSum = 0.0
+            accelWorldUpSum = 0.0
+            accelWorldCount = 0
             gyroSquareSum = 0.0
             gyroCount = 0
             gyroPeak = 0.0
@@ -269,6 +323,16 @@ class SensorCollector(private val context: Context) : SensorEventListener {
         accelSquareSum += magnitude * magnitude
         accelCount++
         accelPeak = max(accelPeak, abs(magnitude))
+        accelX = x
+        accelY = y
+        accelZ = z
+        val r = deviceToWorld ?: return
+        // getRotationMatrix's convention: the matrix maps device coordinates
+        // to the world frame whose axes are East, North and Up.
+        accelWorldEastSum += (r[0] * x + r[1] * y + r[2] * z).toDouble()
+        accelWorldNorthSum += (r[3] * x + r[4] * y + r[5] * z).toDouble()
+        accelWorldUpSum += (r[6] * x + r[7] * y + r[8] * z).toDouble()
+        accelWorldCount++
     }
 
     private fun updateCompassFromRotationVector(values: FloatArray) {
@@ -276,6 +340,7 @@ class SensorCollector(private val context: Context) : SensorEventListener {
         val orientation = FloatArray(3)
         SensorManager.getRotationMatrixFromVector(rotationMatrix, values)
         SensorManager.getOrientation(rotationMatrix, orientation)
+        deviceToWorld = rotationMatrix
         updateCompassDegrees(orientation[0] * 180.0 / PI, "旋转矢量")
     }
 
