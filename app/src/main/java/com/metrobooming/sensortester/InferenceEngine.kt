@@ -171,6 +171,15 @@ data class InferenceResult(
     // CSV shows how far off the reading was rather than just that a
     // threshold tripped. Null before the reference is ready.
     val fusionReferenceDeviation: Double?,
+    // False until BoardingGate has latched. While false, trainState/state
+    // above are forced to STATE_CALIBRATING regardless of what the
+    // fusion/magnet/mic paths below computed, because none of them can tell
+    // a quiet room from a quiet train; rawTrainState/rawState get the same
+    // override so a CSV doesn't show two different opinions. The gate itself
+    // keeps accumulating and the underlying decision keeps running in the
+    // background throughout, so the moment it latches the reported state is
+    // whatever that decision had already reached, not a cold start.
+    val boarded: Boolean,
     // Echoes of this tick's GPS input, for CSV inspection/comparison. Null
     // whenever no fix was available this tick (no permission, no provider,
     // underground, or the last fix went stale — see GpsCollector).
@@ -508,6 +517,30 @@ class InferenceEngine(
         const val CONFIDENCE_LOW = "低"
         const val CONFIDENCE_NOT_READY = "未就绪"
 
+        // Long trailing window the boarding gate reads the magnet channel
+        // through. Has to be long enough that a station's turnstiles,
+        // escalators and an arriving train (all real magnetic transients,
+        // observed up to 6 microtesla on a real walk into a station) get
+        // smoothed away by the median instead of tripping the gate; 45s is
+        // where the false-positive margin against those stopped growing on
+        // the rides this was tuned against.
+        const val BOARDING_WINDOW_MS = 45_000L
+        const val BOARDING_WINDOW_MIN_SAMPLES = 45
+
+        // How high the window's median has to read before this counts as
+        // "on a moving or magnetically busy train" rather than "indoors,
+        // outdoors, or on a platform". Measured margin on the data this was
+        // tuned against: about 1.5 at home, up to 1.85 walking through a
+        // station, versus 2.2+ once seated on a moving train. See the
+        // BOARDING_WINDOW_MS doc for why the window has to be this long for
+        // that margin to hold.
+        const val BOARDING_JITTER_THRESHOLD = 1.8
+
+        // How long the window median has to stay above the threshold before
+        // boarding latches. Absorbs the platform-side magnetic transients
+        // that spike well past the threshold but only for a few seconds.
+        const val BOARDING_CONFIRMATION_MS = 10_000L
+
         // Defaults for the two field-test switches (2026-09-10): with the
         // mic channel off, a ride isolates what the magnet channel can do on
         // its own. Both flipped back (mic true / magnet false) restores the
@@ -632,6 +665,68 @@ class InferenceEngine(
         }
     }
 
+    // Single-purpose, one-way gate for the problem the rank-normalised
+    // fusion cannot see at all: it asks "is this channel quiet relative to
+    // its own recent history", which is meaningless before a ride has
+    // started, because a phone sitting still at home or in a pocket walking
+    // to the station is quiet relative to itself too. The fusion then has
+    // no history to be surprised by and settles on whichever side of 0.5 the
+    // noise floor happens to land on, which the field data showed was
+    // "运行" about three quarters of the time.
+    //
+    // This gate answers a different, coarser question the rank normalisation
+    // was never meant to answer: is the phone anywhere near a real train.
+    // That question has an honest absolute answer because indoor and
+    // outdoor magnetic noise (a room, a sidewalk, a station concourse) never
+    // approaches what a moving or idling train produces, so a long-window
+    // median against a fixed threshold works globally, unlike every other
+    // absolute threshold this engine tried and rejected in favour of rank
+    // normalisation. See BOARDING_JITTER_THRESHOLD's doc for the margin this
+    // was measured against.
+    //
+    // Once latched it never unlatches for the rest of the ride: the same
+    // long-window median reads just as low sitting at a real platform stop
+    // as it does at home, so unlatching on it would reopen the gate at every
+    // station. The boarding question only needs answering once per ride.
+    private class BoardingGate {
+        private val timestamps = ArrayDeque<Long>()
+        private val values = ArrayDeque<Double>()
+        private var latched = false
+        private var aboveSince: Long? = null
+
+        fun clear() {
+            timestamps.clear()
+            values.clear()
+            latched = false
+            aboveSince = null
+        }
+
+        fun update(smoothedJitter: Double?, now: Long): Boolean {
+            if (latched) return true
+            if (smoothedJitter != null) {
+                timestamps.addLast(now)
+                values.addLast(smoothedJitter)
+            }
+            while (timestamps.firstOrNull()?.let { it < now - BOARDING_WINDOW_MS } == true) {
+                timestamps.removeFirst()
+                values.removeFirst()
+            }
+            if (values.size < BOARDING_WINDOW_MIN_SAMPLES) {
+                aboveSince = null
+                return false
+            }
+            val sorted = values.sorted()
+            val median = sorted[(sorted.size - 1) / 2]
+            if (median >= BOARDING_JITTER_THRESHOLD) {
+                val since = aboveSince ?: now.also { aboveSince = it }
+                if (now - since >= BOARDING_CONFIRMATION_MS) latched = true
+            } else {
+                aboveSince = null
+            }
+            return latched
+        }
+    }
+
     // Rolling window of one channel's values sampled only while the engine
     // was confirmed to be stopped, exposing their median as this ride's stop
     // level. Deliberately not a RankWindow: the whole point is to keep the
@@ -737,6 +832,7 @@ class InferenceEngine(
     private val magnetRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
     private val micRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
     private val pressureRankWindow = RankWindow(FUSION_RANK_WINDOW_MS, FUSION_RANK_MIN_SAMPLES)
+    private val boardingGate = BoardingGate()
     private val magnetStopReference =
         ReferenceWindow(FUSION_STOP_REFERENCE_SPAN_MS, FUSION_STOP_REFERENCE_MIN_SAMPLES)
     private val pressureStopReference =
@@ -795,6 +891,7 @@ class InferenceEngine(
         pressureRankWindow.clear()
         magnetStopReference.clear()
         pressureStopReference.clear()
+        boardingGate.clear()
         fusionLastTransitionAt = null
         fusionPreviousState = null
         fusionStopCandidateSince = null
@@ -847,6 +944,12 @@ class InferenceEngine(
         } else {
             null
         }
+
+        // Fed from the same smoothed jitter sample every tick regardless of
+        // which channel ends up authoritative below, so the window is full
+        // and ready to latch the moment a real ride starts even if GPS was
+        // deciding up to that point.
+        val boarded = boardingGate.update(magnetJitterSmoothed, now)
 
         // Label this smoothed sample with whichever train state was stable
         // going into this tick (before any transition below) and fold it
@@ -1038,6 +1141,9 @@ class InferenceEngine(
                 gpsCandidateState = gpsOutcome.candidateState,
                 gpsStopCandidateElapsedMs = gpsOutcome.stopCandidateElapsedMs,
                 gpsMovingCandidateElapsedMs = gpsOutcome.movingCandidateElapsedMs,
+                // A real GPS fix is not subject to the blind spot this gate
+                // exists for, so GPS bypasses it outright.
+                boarded = true,
                 reason = gpsOutcome.reason ?: "gps-hold-state",
             )
         }
@@ -1091,6 +1197,7 @@ class InferenceEngine(
                 gpsCandidateState = gpsOutcome.candidateState,
                 gpsStopCandidateElapsedMs = 0L,
                 gpsMovingCandidateElapsedMs = 0L,
+                boarded = boarded,
                 reason = fusionOutcome.reason,
             )
         }
@@ -1143,6 +1250,10 @@ class InferenceEngine(
                 gpsCandidateState = gpsOutcome.candidateState,
                 gpsStopCandidateElapsedMs = 0L,
                 gpsMovingCandidateElapsedMs = 0L,
+                // Absolute-threshold legacy path; the boarding gate does not
+                // apply to it. See the note above updateFusionState's call
+                // site.
+                boarded = true,
                 reason = magnetOutcome.reason,
             )
         }
@@ -1194,6 +1305,7 @@ class InferenceEngine(
                 gpsCandidateState = gpsOutcome.candidateState,
                 gpsStopCandidateElapsedMs = 0L,
                 gpsMovingCandidateElapsedMs = 0L,
+                boarded = true,
                 reason = if (magnetOutcome.calibrationStatus == MAGNET_STATUS_UNUSABLE) {
                     "magnet-unusable-mic-disabled-hold-state"
                 } else {
@@ -1240,6 +1352,7 @@ class InferenceEngine(
                 gpsCandidateState = gpsOutcome.candidateState,
                 gpsStopCandidateElapsedMs = 0L,
                 gpsMovingCandidateElapsedMs = 0L,
+                boarded = true,
                 reason = if (micValid) "mic-zero-hold-state" else "mic-invalid-hold-state",
             )
         }
@@ -1408,6 +1521,7 @@ class InferenceEngine(
             gpsCandidateState = gpsOutcome.candidateState,
             gpsStopCandidateElapsedMs = 0L,
             gpsMovingCandidateElapsedMs = 0L,
+            boarded = true,
             reason = reason,
         )
     }
@@ -1447,20 +1561,31 @@ class InferenceEngine(
         gpsCandidateState: String?,
         gpsStopCandidateElapsedMs: Long,
         gpsMovingCandidateElapsedMs: Long,
+        boarded: Boolean,
         reason: String,
     ): InferenceResult {
-        val state = combinedState(stableTrainState, playerActive)
-        val rawState = combinedState(rawTrainState, playerActive)
+        // See BoardingGate's doc: unlatched means no channel below has
+        // enough context to tell a quiet room from a quiet train, so the
+        // verdict they reached this tick is withheld from the report. Their
+        // internal state machines keep running regardless (stableTrainState
+        // is not touched here), so the report catches up to whatever they
+        // had already decided the instant the gate latches.
+        val reportedTrainState = if (boarded) stableTrainState else STATE_CALIBRATING
+        val reportedRawTrainState = if (boarded) rawTrainState else STATE_CALIBRATING
+        val state = combinedState(reportedTrainState, playerActive)
+        val rawState = combinedState(reportedRawTrainState, playerActive)
         val finalReason = if (state == STATE_STOPPED_PLAYER_ACTIVE) {
             "$reason;player-active"
+        } else if (!boarded) {
+            "$reason;outdoor-hold"
         } else {
             reason
         }
         return InferenceResult(
             state = state,
             rawState = rawState,
-            trainState = stableTrainState,
-            rawTrainState = rawTrainState,
+            trainState = reportedTrainState,
+            rawTrainState = reportedRawTrainState,
             playerState = playerState,
             playerActive = playerActive,
             micLevelRatio = micLevelRatio,
@@ -1519,6 +1644,7 @@ class InferenceEngine(
             fusionStopReferencePressure = fusionOutcome.stopReferencePressure,
             fusionConfidence = fusionOutcome.confidence,
             fusionReferenceDeviation = fusionOutcome.referenceDeviation,
+            boarded = boarded,
             gpsSpeedMps = gpsSpeedMps,
             gpsAccuracyM = gpsAccuracyM,
             gpsCalibrationStatus = gpsCalibrationStatus,

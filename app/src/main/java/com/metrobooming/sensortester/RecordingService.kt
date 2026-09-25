@@ -83,6 +83,7 @@ class RecordingService : Service() {
             "fusion_stop_reference_ready",
             "fusion_stop_reference_magnet", "fusion_stop_reference_pressure",
             "fusion_confidence", "fusion_reference_deviation",
+            "boarded",
             "fusion_enabled",
             "battery_percent", "battery_charge_counter_uah", "battery_current_ua",
             "battery_temperature_c", "battery_charging", "battery_plugged",
@@ -315,6 +316,7 @@ class RecordingService : Service() {
                 gyroRmsDegS = gyroRmsDeg,
                 confidence = inferred.fusionConfidence,
                 confidenceReady = inferred.fusionStopReferenceReady,
+                boarded = inferred.boarded,
             )
             val row = listOf(
                 Instant.ofEpochMilli(wallClockNow).toString(), now - startedAt,
@@ -329,7 +331,7 @@ class RecordingService : Service() {
                 if (sensor.pressureHpa != null) 1 else 0, sensor.pressureHpa,
                 if (mic.active) 1 else 0, if (mic.valid) 1 else 0,
                 mic.rms, mic.peak, mic.inputDevice,
-                6, inferred.rawState, inferred.state,
+                7, inferred.rawState, inferred.state,
                 inferred.rawTrainState, inferred.trainState,
                 inferred.playerState,
                 if (inferred.trainState == "运行") 1 else 0,
@@ -382,6 +384,7 @@ class RecordingService : Service() {
                 inferred.fusionStopReferencePressure,
                 inferred.fusionConfidence,
                 inferred.fusionReferenceDeviation,
+                if (inferred.boarded) 1 else 0,
                 if (inference.fusionEnabled) 1 else 0,
                 battery.percent,
                 battery.chargeCounterUah,

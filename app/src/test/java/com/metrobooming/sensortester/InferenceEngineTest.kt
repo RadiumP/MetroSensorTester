@@ -892,4 +892,40 @@ class InferenceEngineTest {
         assertFalse(feed.last!!.reason.contains("revert"))
         assertEquals(0L, feed.last!!.fusionLockoutRemainingMs)
     }
+
+    @Test
+    fun boardingGateWithholdsTheVerdictUntilSustainedMagneticActivity() {
+        // The field case this exists for: opening the app at home, or on a
+        // platform before a train arrives. The magnet channel never gets
+        // anywhere near what a real train produces, so whatever the rank
+        // fusion is scoring internally, nothing should be reported yet.
+        val engine = InferenceEngine()
+        val feed = FusionFeed(engine)
+
+        feed.run(0.5, 0.005, 300)
+        assertFalse(feed.last!!.boarded)
+        assertEquals("校准中", feed.last!!.trainState)
+        assertTrue(feed.last!!.reason.endsWith(";outdoor-hold"))
+
+        // Sustained real magnetic activity, comfortably past
+        // BOARDING_WINDOW_MS and BOARDING_CONFIRMATION_MS.
+        feed.run(5.0, 0.08, 200)
+        assertTrue(feed.last!!.boarded)
+        assertTrue(feed.last!!.trainState != "校准中")
+    }
+
+    @Test
+    fun boardingGateNeverUnlatchesOnceBoarded() {
+        val engine = InferenceEngine()
+        val feed = FusionFeed(engine)
+
+        feed.run(5.0, 0.08, 200)
+        assertTrue(feed.last!!.boarded)
+
+        // A real platform stop reads just as quiet as home did, but the
+        // gate is one way: it must not re-arm and hide the state again.
+        feed.run(0.4, 0.004, 300)
+        assertTrue(feed.last!!.boarded)
+        assertTrue(feed.last!!.trainState != "校准中")
+    }
 }

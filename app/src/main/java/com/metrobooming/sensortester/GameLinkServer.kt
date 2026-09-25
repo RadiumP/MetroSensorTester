@@ -106,6 +106,7 @@ class GameLinkServer {
         gyroRmsDegS: Double,
         confidence: String,
         confidenceReady: Boolean,
+        boarded: Boolean,
     ) {
         // Safe to check on the caller's (main) thread — only guards an early
         // return, no I/O happens here.
@@ -132,6 +133,15 @@ class GameLinkServer {
             // confidence at all, which is the window the game covers with
             // its fixed warmup round.
             put("confidence_ready", confidenceReady)
+            // False until BoardingGate has latched (see its doc in
+            // InferenceEngine.kt): state/train_moving above are held at
+            // "校准中" / false until then, because nothing in the fusion
+            // path can distinguish a quiet room or platform from a quiet
+            // train. The game's warmup round should end on this becoming
+            // true rather than on a fixed timer, since there is no fixed
+            // relationship between how long the app has been open and
+            // whether the player has actually boarded.
+            put("boarded", boarded)
         }
         val line = (json.toString() + "\n").toByteArray(Charsets.UTF_8)
         // The actual socket write is the network I/O part — runs on ioExecutor,
