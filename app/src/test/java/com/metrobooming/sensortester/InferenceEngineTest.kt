@@ -114,7 +114,7 @@ class InferenceEngineTest {
         assertEquals("停站", result.trainState)
         assertEquals("活动", result.playerState)
         assertTrue(result.playerActive)
-        assertEquals("停站但玩家活动", result.state)
+        assertEquals("停站+人动", result.state)
     }
 
     @Test

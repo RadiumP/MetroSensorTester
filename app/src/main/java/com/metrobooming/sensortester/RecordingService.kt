@@ -329,7 +329,7 @@ class RecordingService : Service() {
                 if (sensor.pressureHpa != null) 1 else 0, sensor.pressureHpa,
                 if (mic.active) 1 else 0, if (mic.valid) 1 else 0,
                 mic.rms, mic.peak, mic.inputDevice,
-                5, inferred.rawState, inferred.state,
+                6, inferred.rawState, inferred.state,
                 inferred.rawTrainState, inferred.trainState,
                 inferred.playerState,
                 if (inferred.trainState == "运行") 1 else 0,
